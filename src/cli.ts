@@ -174,6 +174,9 @@ async function main() {
 
     if (existsSync(serverPath)) {
       console.log(`${color("Meiden", colors.cyan)} ${color("starting standalone server", colors.dim)}`);
+      if (parsed.port) {
+        process.env.PORT = String(parsed.port);
+      }
       await import(pathToFileURL(serverPath).href);
       return;
     }
