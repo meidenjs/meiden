@@ -1,15 +1,23 @@
 {
-  "name": "mei",
-  "version": "1.0.50",
+  "name": "meiden",
+  "version": "0.0.1",
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "bun run --watch src/index.ts"
+    "dev": "bun --hot src/cli.ts dev example",
+    "build": "bun run src/cli.ts build example",
+    "start": "bun run src/cli.ts start example"
+  },
+  "bin": {
+    "meiden": "./bin/meiden"
   },
   "dependencies": {
-    "elysia": "latest"
+    "elysia": "latest",
+    "oxc-parser": "^0.132.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
     "bun-types": "latest"
   },
-  "module": "src/index.js"
+  "module": "src/cli.ts"
 }
