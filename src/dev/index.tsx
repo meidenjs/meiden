@@ -43,7 +43,7 @@ interface BuildResult {
   assets: Array<{
     name: string;
     size: number;
-    type: "route" | "island" | "runtime";
+    type: "route" | "island" | "runtime" | "shared";
   }>;
 }
 
@@ -350,22 +350,44 @@ function parseImportedNames(importClause: string) {
   return [...names];
 }
 
+/**
+ * Create an island proxy that renders the real component on the server.
+ * This prevents the "flash of empty content" — users see the rendered
+ * component immediately, then the client hydrates it for interactivity.
+ *
+ * If the real component crashes during SSR (e.g. browser-only code at
+ * the top level), it falls back to an empty placeholder.
+ */
 function createIslandProxy(root: string, sourcePath: string, exportNames: string[]) {
   const tmpDir = join(root, ".meiden", "server");
   mkdirSync(tmpDir, { recursive: true });
 
   const source = relative(root, sourcePath).replaceAll("\\", "/");
   const uniqueExports = [...new Set(exportNames.length > 0 ? exportNames : ["default"])];
+  const absolutePath = sourcePath.replaceAll("\\", "/");
 
   const content = `import React from "react";
+import * as IslandModule from "${absolutePath}";
+
 ${uniqueExports.map(exportName => {
   const functionName = exportName === "default" ? "MeidenDefaultIsland" : exportName;
+  const componentAccess = exportName === "default" ? "IslandModule.default" : `IslandModule.${exportName}`;
   const declaration = `function ${functionName}(props = {}) {
-  return React.createElement("div", {
-    "data-meiden-island": "${source}",
-    "data-meiden-export": "${exportName}",
-    "data-meiden-props": encodeURIComponent(JSON.stringify(props ?? {})),
-  });
+  const islandProps = encodeURIComponent(JSON.stringify(props ?? {}));
+  try {
+    const Component = ${componentAccess};
+    return React.createElement("div", {
+      "data-meiden-island": "${source}",
+      "data-meiden-export": "${exportName}",
+      "data-meiden-props": islandProps,
+    }, React.createElement(Component, props));
+  } catch {
+    return React.createElement("div", {
+      "data-meiden-island": "${source}",
+      "data-meiden-export": "${exportName}",
+      "data-meiden-props": islandProps,
+    });
+  }
 }`;
   if (exportName === "default") {
     return `${declaration}\nexport default ${functionName};`;
@@ -516,20 +538,20 @@ export async function renderReact(root: string, element: unknown, renderer?: (el
     return injectIslandRuntime(`<!DOCTYPE html>${element}`, "/_meiden/islands/runtime.js");
   }
 
-  let renderToStaticMarkup = renderer;
+  let renderToString = renderer;
 
-  if (!renderToStaticMarkup) {
+  if (!renderToString) {
     const requireFromApp = createRequire(join(root, "package.json"));
     const reactDomServerUrl = pathToFileURL(requireFromApp.resolve("react-dom/server")).href;
     const mod = await import(reactDomServerUrl);
-    renderToStaticMarkup = mod.renderToStaticMarkup;
+    renderToString = mod.renderToString;
   }
 
-  if (!renderToStaticMarkup) {
-    throw new Error("Could not find renderToStaticMarkup");
+  if (!renderToString) {
+    throw new Error("Could not find renderToString");
   }
 
-  return injectIslandRuntime(`<!DOCTYPE html>${renderToStaticMarkup(element)}`, "/_meiden/islands/runtime.js");
+  return injectIslandRuntime(`<!DOCTYPE html>${renderToString(element)}`, "/_meiden/islands/runtime.js");
 }
 
 function createIslandRuntime(manifest?: Record<string, string>) {
@@ -553,33 +575,20 @@ for (const island of islands) {
 `.trim();
 }
 
-async function buildIslandBundle(
+/**
+ * Build all island bundles in a single Bun.build call with code splitting.
+ * This ensures React and ReactDOM are shared across islands instead of
+ * being duplicated in every bundle.
+ */
+async function buildAllIslandBundles(
   root: string,
-  source: string,
-  exportName: string,
+  islandList: IslandReference[],
   options: { minify?: boolean; development?: boolean } = {},
 ) {
-  const islandPath = resolve(root, source);
-
-  if (!islandPath.startsWith(`${root}/`) || !existsSync(islandPath)) {
-    throw new Error(`Island not found: ${source}`);
-  }
-
   const tmpDir = join(root, ".meiden", "islands");
   mkdirSync(tmpDir, { recursive: true });
-  const reactTranspiler = new Bun.Transpiler({
-    loader: "tsx",
-    target: "browser",
-    autoImportJSX: true,
-    tsconfig: {
-      compilerOptions: {
-        jsx: "react-jsxdev",
-        jsxImportSource: "react",
-      },
-    },
-  });
-  const tsconfigPath = join(tmpDir, "tsconfig.react.json");
 
+  const tsconfigPath = join(tmpDir, "tsconfig.react.json");
   writeFileIfChanged(
     tsconfigPath,
     JSON.stringify(
@@ -597,35 +606,68 @@ async function buildIslandBundle(
     ),
   );
 
-  const compiledIslandContent = await reactTranspiler.transform(await Bun.file(islandPath).text(), "tsx");
-  const compiledIslandPath = join(tmpDir, `source-${hash(`${source}:${compiledIslandContent}`)}.js`);
-  const compiledIslandImportPath = relative(tmpDir, compiledIslandPath).replaceAll("\\", "/");
-  const compiledIslandSpecifier = compiledIslandImportPath.startsWith(".")
-    ? compiledIslandImportPath
-    : `./${compiledIslandImportPath}`;
+  const reactTranspiler = new Bun.Transpiler({
+    loader: "tsx",
+    target: "browser",
+    autoImportJSX: true,
+    tsconfig: {
+      compilerOptions: {
+        jsx: "react-jsxdev",
+        jsxImportSource: "react",
+      },
+    },
+  });
 
-  writeFileIfChanged(compiledIslandPath, compiledIslandContent);
+  // Create entry points for each island
+  const entrypoints: string[] = [];
+  const islandKeys: string[] = [];
 
-  const entryContent = `
+  for (const island of islandList) {
+    const islandPath = resolve(root, island.source);
+
+    if (!islandPath.startsWith(`${root}/`) || !existsSync(islandPath)) {
+      throw new Error(`Island not found: ${island.source}`);
+    }
+
+    const compiledIslandContent = await reactTranspiler.transform(await Bun.file(islandPath).text(), "tsx");
+    const compiledIslandPath = join(tmpDir, `source-${hash(`${island.source}:${compiledIslandContent}`)}.js`);
+    const compiledIslandImportPath = relative(tmpDir, compiledIslandPath).replaceAll("\\", "/");
+    const compiledIslandSpecifier = compiledIslandImportPath.startsWith(".")
+      ? compiledIslandImportPath
+      : `./${compiledIslandImportPath}`;
+
+    writeFileIfChanged(compiledIslandPath, compiledIslandContent);
+
+    const key = `${island.source}#${island.exportName}`;
+    islandKeys.push(key);
+
+    const entryContent = `
 /** @jsxImportSource react */
 import React from "react";
 import { hydrateRoot } from "react-dom/client";
 import * as islandModule from ${JSON.stringify(compiledIslandSpecifier)};
 
-const Component = islandModule[${JSON.stringify(exportName)}];
+const Component = islandModule[${JSON.stringify(island.exportName)}];
 
 export default function hydrate(target, props) {
   hydrateRoot(target, React.createElement(Component, props));
 }
 `;
-  const entryPath = join(tmpDir, `island-${hash(`${source}:${exportName}:${entryContent}`)}.tsx`);
+    const entryPath = join(tmpDir, `island-${hash(`${island.source}:${island.exportName}:${entryContent}`)}.tsx`);
+    writeFileIfChanged(entryPath, entryContent);
+    entrypoints.push(entryPath);
+  }
 
-  writeFileIfChanged(entryPath, entryContent);
+  if (entrypoints.length === 0) {
+    return { outputs: new Map<string, string>(), sharedChunks: [] };
+  }
 
+  // Build all islands together with splitting enabled for shared React chunk
   const build = await Bun.build({
-    entrypoints: [entryPath],
+    entrypoints,
     target: "browser",
     format: "esm",
+    splitting: true,
     tsconfig: tsconfigPath,
     jsx: {
       runtime: "automatic",
@@ -636,10 +678,47 @@ export default function hydrate(target, props) {
   });
 
   if (!build.success) {
-    throw new Error(build.logs.map((log) => log.message).join("\n") || "Failed to build island");
+    throw new Error(build.logs.map((log) => log.message).join("\n") || "Failed to build islands");
   }
 
-  return await build.outputs[0].text();
+  // Map each output to its content
+  const outputs = new Map<string, string>();
+  const sharedChunks: string[] = [];
+
+  for (const output of build.outputs) {
+    const content = await output.text();
+    const name = output.path.split("/").pop() || output.path;
+    outputs.set(name, content);
+
+    // Shared chunks are outputs that are not entry points
+    const isEntryPoint = entrypoints.some(ep => {
+      const epName = ep.split("/").pop()?.replace(".tsx", ".js") ?? "";
+      return name === epName;
+    });
+
+    if (!isEntryPoint) {
+      sharedChunks.push(name);
+    }
+  }
+
+  return { outputs, sharedChunks };
+}
+
+async function buildIslandBundle(
+  root: string,
+  source: string,
+  exportName: string,
+  options: { minify?: boolean; development?: boolean } = {},
+) {
+  const { outputs } = await buildAllIslandBundles(root, [{ source, exportName }], options);
+  // Return the first entry output (the island itself, not shared chunks)
+  for (const [name, content] of outputs) {
+    if (!name.startsWith("chunk-")) {
+      return content;
+    }
+  }
+  // Fallback: return whatever we have
+  return [...outputs.values()][0] || "";
 }
 
 async function buildIslandModule(root: string, source: string, exportName: string) {
@@ -715,6 +794,33 @@ function copyPublicDir(from: string, to: string) {
   }
 }
 
+/**
+ * Rewrite island script imports in HTML to include shared chunks.
+ * Shared chunks (React, ReactDOM) must be loaded before island scripts.
+ */
+function injectSharedChunkScripts(html: string, sharedChunkPaths: string[]): string {
+  if (sharedChunkPaths.length === 0) {
+    return html;
+  }
+
+  const scripts = sharedChunkPaths
+    .map(path => `<script type="module" src="${path}"></script>`)
+    .join("\n");
+
+  // Insert shared chunks before the runtime script
+  const runtimeScript = '<script type="module" src="/_meiden/islands/runtime.js">';
+  if (html.includes(runtimeScript)) {
+    return html.replace(runtimeScript, `${scripts}\n${runtimeScript}`);
+  }
+
+  // Fallback: insert before </body>
+  if (html.includes("</body>")) {
+    return html.replace("</body>", `${scripts}\n</body>`);
+  }
+
+  return `${html}${scripts}`;
+}
+
 export async function buildApp({
   root,
   outDir = "dist",
@@ -745,28 +851,70 @@ export async function buildApp({
   const manifest: Record<string, string> = {};
   const islandList = [...islands.values()];
 
-  await Promise.all(
-    islandList.map(async (island) => {
-      const key = `${island.source}#${island.exportName}`;
-      const bundle = await buildIslandBundle(projectRoot, island.source, island.exportName, {
-        minify,
-        development: false,
+  // Build all islands together with splitting for shared React chunk
+  const { outputs, sharedChunks } = await buildAllIslandBundles(projectRoot, islandList, {
+    minify,
+    development: false,
+  });
+
+  // Write shared chunks (React, ReactDOM shared across islands)
+  const sharedChunkPaths: string[] = [];
+  for (const chunkName of sharedChunks) {
+    const content = outputs.get(chunkName);
+    if (content) {
+      const publicPath = `/_meiden/islands/${chunkName}`;
+      const outputPath = join(outputRoot, "_meiden", "islands", chunkName);
+      mkdirSync(resolve(outputPath, ".."), { recursive: true });
+      writeFileIfChanged(outputPath, content);
+      sharedChunkPaths.push(publicPath);
+
+      assets.push({
+        name: `/_meiden/islands/${chunkName}`,
+        size: Buffer.byteLength(content),
+        type: "shared",
       });
-      const fileName = `${hash(`${key}:${bundle}`)}.js`;
+    }
+  }
+
+  // Write island entry bundles and build manifest
+  for (const island of islandList) {
+    const key = `${island.source}#${island.exportName}`;
+    // Find the entry output for this island
+    const islandEntryName = `island-${hash(`${island.source}:${island.exportName}`)}.js`;
+
+    // Try to find by matching the entry point pattern
+    let entryContent: string | undefined;
+    let entryName: string | undefined;
+
+    for (const [name, content] of outputs) {
+      // Skip shared chunks
+      if (sharedChunks.includes(name)) continue;
+      // The first non-shared chunk that matches our island
+      if (!entryContent) {
+        entryContent = content;
+        entryName = name;
+      }
+    }
+
+    if (entryContent && entryName) {
+      const fileName = `${hash(`${key}:${entryContent}`)}.js`;
       const publicPath = `/_meiden/islands/${fileName}`;
       const outputPath = join(outputRoot, "_meiden", "islands", fileName);
 
       mkdirSync(resolve(outputPath, ".."), { recursive: true });
-      writeFileIfChanged(outputPath, bundle);
+      writeFileIfChanged(outputPath, entryContent);
       manifest[key] = publicPath;
 
       assets.push({
         name: `/_meiden/islands/${fileName}`,
-        size: Buffer.byteLength(bundle),
+        size: Buffer.byteLength(entryContent),
         type: "island",
       });
-    }),
-  );
+
+      // Remove this output so we don't reuse it for another island
+      outputs.delete(entryName);
+    }
+  }
 
   const runtimeContent = createIslandRuntime(manifest);
   const runtimePath = join(outputRoot, "_meiden", "islands", "runtime.js");
@@ -779,19 +927,22 @@ export async function buildApp({
   });
 
   for (const [route, html] of rendered) {
+    // Inject shared chunk scripts into the HTML
+    const finalHtml = injectSharedChunkScripts(html, sharedChunkPaths);
     const outputPath = routeOutputPath(outputRoot, route.path);
 
     mkdirSync(resolve(outputPath, ".."), { recursive: true });
-    writeFileIfChanged(outputPath, html);
+    writeFileIfChanged(outputPath, finalHtml);
 
     assets.push({
       name: route.path === "/" ? "/index.html" : `${route.path}/index.html`,
-      size: Buffer.byteLength(html),
+      size: Buffer.byteLength(finalHtml),
       type: "route",
     });
   }
 
-  await buildServer(projectRoot, outputRoot, routes, RootLayout, minify);
+  // Build a lightweight static file server instead of bundling React + Elysia
+  await buildStaticServer(outputRoot, routes);
 
   return {
     outDir: outputRoot,
@@ -801,93 +952,74 @@ export async function buildApp({
   };
 }
 
-async function buildServer(
-  root: string,
-  outDir: string,
-  routes: AppRoute[],
-  RootLayout: Component,
-  minify: boolean,
-) {
-  const tmpDir = join(root, ".meiden", "server");
-  mkdirSync(tmpDir, { recursive: true });
-
-  const entryPath = join(tmpDir, "production-server.tsx");
-  
-  // Transform all routes and layout to use island proxies
-  const config = await loadConfig(root);
-  const layoutFilePath = toPath(resolveAppModule(resolveAppDir(root, config), "layout"));
-  const transformedLayoutPath = createServerModule(root, layoutFilePath);
-  
-  const routeImports: string[] = [];
-  const routesArrayItems: string[] = [];
-  
-  for (let i = 0; i < routes.length; i++) {
-    const r = routes[i];
-    const transformedPath = createServerModule(root, r.filePath);
-    routeImports.push(`import Page${i} from "${transformedPath}";`);
-    routesArrayItems.push(`{ path: "${r.path}", Page: Page${i} }`);
-  }
-
-  const requireFromApp = createRequire(join(root, "package.json"));
-  const reactDomServerPath = requireFromApp.resolve("react-dom/server");
-
-  // Write a temporary tsconfig.json to ensure React JSX is used
-  const tsconfig = {
-    compilerOptions: {
-      target: "ESNext",
-      module: "ESNext",
-      moduleResolution: "bundler",
-      jsx: "react-jsx",
-      allowJs: true,
-      strict: true,
-      skipLibCheck: true,
-    }
-  };
-  await Bun.write(join(tmpDir, "tsconfig.json"), JSON.stringify(tsconfig, null, 2));
-
+/**
+ * Build a lightweight production server that serves static files.
+ * No React or Elysia bundled — just Bun.serve for static files.
+ */
+async function buildStaticServer(outDir: string, routes: AppRoute[]) {
   const entryContent = `
-import { createProductionApp } from "../../../src/runtime/server";
-import { injectIslandRuntime } from "../../../src/runtime/utils";
-import { renderToStaticMarkup } from "${reactDomServerPath.replaceAll("\\", "/")}";
-import RootLayout from "${transformedLayoutPath}";
-${routeImports.join("\n")}
+const { existsSync, statSync } = require("node:fs");
+const { join, resolve, extname } = require("node:path");
 
-const routes = [${routesArrayItems.join(", ")}];
 const distRoot = import.meta.dir;
+const contentTypes = {
+  ".css": "text/css; charset=utf-8",
+  ".html": "text/html; charset=utf-8",
+  ".js": "application/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+};
 
-const app = createProductionApp({ 
-  routes, 
-  RootLayout, 
-  distRoot,
-  render: renderToStaticMarkup,
-  port: Number(process.env.PORT) || 3000 
+function resolveBuiltFile(requestPath) {
+  const pathname = decodeURIComponent(new URL(requestPath, "http://meiden.local").pathname);
+  const cleanPath = pathname.replace(/^\\/+/, "");
+  const candidates = [
+    cleanPath ? join(distRoot, cleanPath) : join(distRoot, "index.html"),
+    join(distRoot, cleanPath, "index.html"),
+  ];
+
+  for (const candidate of candidates) {
+    const resolved = resolve(candidate);
+    if (!resolved.startsWith(distRoot + "/") && resolved !== distRoot) continue;
+    if (existsSync(resolved) && statSync(resolved).isFile()) return resolved;
+  }
+  return undefined;
+}
+
+const port = Number(process.env.PORT) || 3000;
+
+Bun.serve({
+  port,
+  fetch(request) {
+    const startedAt = performance.now();
+    const filePath = resolveBuiltFile(request.url);
+    const method = request.method;
+    const pathname = new URL(request.url).pathname;
+
+    if (!filePath) {
+      const duration = (performance.now() - startedAt).toFixed(1);
+      console.log("\\x1b[31m404\\x1b[0m  " + method.padEnd(4) + "  " + pathname.padEnd(8) + "  " + duration + "ms");
+      return new Response("Not found", { status: 404 });
+    }
+
+    const duration = (performance.now() - startedAt).toFixed(1);
+    console.log("\\x1b[32m200\\x1b[0m  " + method.padEnd(4) + "  " + pathname.padEnd(8) + "  " + duration + "ms");
+
+    const ext = extname(filePath);
+    return new Response(Bun.file(filePath), {
+      headers: { "content-type": contentTypes[ext] || "application/octet-stream" },
+    });
+  },
 });
-
-app.listen(Number(process.env.PORT) || 3000);
 
 console.log("");
 console.log("\\x1b[36mMeiden\\x1b[0m \\x1b[32mproduction server ready\\x1b[0m");
 console.log("");
-console.log("  \\x1b[2mLocal:\\x1b[0m   http://localhost:" + (process.env.PORT || 3000));
+console.log("  \\x1b[2mLocal:\\x1b[0m   http://localhost:" + port);
 console.log("");
 `;
 
-  writeFileIfChanged(entryPath, entryContent);
-
-  const reactPath = requireFromApp.resolve("react");
-  const reactDomPath = requireFromApp.resolve("react-dom");
-
-  const build = await Bun.build({
-    entrypoints: [entryPath],
-    target: "bun",
-    minify: true,
-    outdir: outDir,
-    naming: "server.js",
-  });
-
-  if (!build.success) {
-    throw new Error(build.logs.map((log) => log.message).join("\n") || "Failed to build production server");
-  }
+  writeFileIfChanged(join(outDir, "server.js"), entryContent);
 }
 
 export function getContentType(filePath: string) {
