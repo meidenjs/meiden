@@ -17,16 +17,13 @@ export interface ProductionServerOptions {
   port?: number;
 }
 
-function unescapeHTML(str: string) {
-  return str.replace(/&lt;/g, "<")
-            .replace(/&gt;/g, ">")
-            .replace(/&quot;/g, '"')
-            .replace(/&#34;/g, '"')
-            .replace(/&#39;/g, "'")
-            .replace(/&#x27;/g, "'")
-            .replace(/&amp;/g, "&");
-}
-
+/**
+ * Create a production Elysia app with SSR support.
+ *
+ * Note: For static builds, use `meiden build` which generates a lightweight
+ * static file server instead. This function is kept for dynamic SSR use cases
+ * where pages need to be rendered at request time.
+ */
 export function createProductionApp({ routes, RootLayout, distRoot, render }: ProductionServerOptions) {
   const app = new Elysia().onRequest(({ request }) => {
     console.log(`\x1b[2m${request.method}\x1b[0m ${new URL(request.url).pathname}`);
@@ -37,7 +34,7 @@ export function createProductionApp({ routes, RootLayout, distRoot, render }: Pr
     const url = new URL(request.url);
     const pathname = decodeURIComponent(url.pathname).replace(/^\/+/, "");
     const filePath = `${distRoot}/${pathname}`;
-    
+
     const file = Bun.file(filePath);
     if (await file.exists()) {
       set.headers["content-type"] = getContentType(filePath);
@@ -51,23 +48,19 @@ export function createProductionApp({ routes, RootLayout, distRoot, render }: Pr
     app.get(route.path, async ({ set }) => {
       const startedAt = performance.now();
       try {
-        const element = React.createElement(RootLayout, { 
-          children: React.createElement(route.Page) 
+        const element = React.createElement(RootLayout, {
+          children: React.createElement(route.Page),
         });
-        let markup = render(element);
-        
-        // Ensure it's unescaped
-        markup = unescapeHTML(markup);
-        
+        const markup = render(element);
         const content = injectIslandRuntime(`<!DOCTYPE html>${markup}`, "/_meiden/islands/runtime.js");
-        
+
         console.log(`\x1b[32m200\x1b[0m  GET   ${route.path}     ${(performance.now() - startedAt).toFixed(2)}ms`);
-        
+
         set.headers["content-type"] = "text/html; charset=utf-8";
         return new Response(content, {
           headers: {
-            "content-type": "text/html; charset=utf-8"
-          }
+            "content-type": "text/html; charset=utf-8",
+          },
         });
       } catch (error: any) {
         console.log(`\x1b[31m500\x1b[0m  GET   ${route.path}     ${(performance.now() - startedAt).toFixed(2)}ms`);

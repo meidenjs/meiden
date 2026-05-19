@@ -356,7 +356,7 @@ function parseImportedNames(importClause: string) {
  * component immediately, then the client hydrates it for interactivity.
  *
  * If the real component crashes during SSR (e.g. browser-only code at
- * the top level), it falls back to an empty placeholder.
+ * the top level), it falls back to an empty placeholder and logs the error.
  */
 function createIslandProxy(root: string, sourcePath: string, exportNames: string[]) {
   const tmpDir = join(root, ".meiden", "server");
@@ -381,7 +381,8 @@ ${uniqueExports.map(exportName => {
       "data-meiden-export": "${exportName}",
       "data-meiden-props": islandProps,
     }, React.createElement(Component, props));
-  } catch {
+  } catch (error) {
+    console.error("[meiden] SSR failed for island ${source}#${exportName}:", error);
     return React.createElement("div", {
       "data-meiden-island": "${source}",
       "data-meiden-export": "${exportName}",
@@ -579,6 +580,9 @@ for (const island of islands) {
  * Build all island bundles in a single Bun.build call with code splitting.
  * This ensures React and ReactDOM are shared across islands instead of
  * being duplicated in every bundle.
+ *
+ * Returns a mapping from island key ("source#exportName") to its bundle
+ * content, plus the shared chunk names and their contents.
  */
 async function buildAllIslandBundles(
   root: string,
@@ -618,9 +622,10 @@ async function buildAllIslandBundles(
     },
   });
 
-  // Create entry points for each island
+  // Create entry points for each island, tracking the mapping
+  // from entry filename → island key for reliable matching
   const entrypoints: string[] = [];
-  const islandKeys: string[] = [];
+  const entryToIslandKey = new Map<string, string>(); // entry basename (.js) → island key
 
   for (const island of islandList) {
     const islandPath = resolve(root, island.source);
@@ -639,7 +644,10 @@ async function buildAllIslandBundles(
     writeFileIfChanged(compiledIslandPath, compiledIslandContent);
 
     const key = `${island.source}#${island.exportName}`;
-    islandKeys.push(key);
+
+    // Use a deterministic name based on island identity (not content)
+    // so we can reliably match the build output back to this island
+    const entryBasename = `island-${hash(`${island.source}:${island.exportName}`)}`;
 
     const entryContent = `
 /** @jsxImportSource react */
@@ -653,13 +661,16 @@ export default function hydrate(target, props) {
   hydrateRoot(target, React.createElement(Component, props));
 }
 `;
-    const entryPath = join(tmpDir, `island-${hash(`${island.source}:${island.exportName}:${entryContent}`)}.tsx`);
+    const entryPath = join(tmpDir, `${entryBasename}.tsx`);
     writeFileIfChanged(entryPath, entryContent);
     entrypoints.push(entryPath);
+
+    // Map the expected output filename back to the island key
+    entryToIslandKey.set(`${entryBasename}.js`, key);
   }
 
   if (entrypoints.length === 0) {
-    return { outputs: new Map<string, string>(), sharedChunks: [] };
+    return { islandOutputs: new Map<string, string>(), sharedChunks: new Map<string, string>() };
   }
 
   // Build all islands together with splitting enabled for shared React chunk
@@ -681,27 +692,25 @@ export default function hydrate(target, props) {
     throw new Error(build.logs.map((log) => log.message).join("\n") || "Failed to build islands");
   }
 
-  // Map each output to its content
-  const outputs = new Map<string, string>();
-  const sharedChunks: string[] = [];
+  // Map each output to its island key or shared chunk
+  const islandOutputs = new Map<string, string>(); // island key → content
+  const sharedChunks = new Map<string, string>(); // chunk name → content
 
   for (const output of build.outputs) {
     const content = await output.text();
     const name = output.path.split("/").pop() || output.path;
-    outputs.set(name, content);
 
-    // Shared chunks are outputs that are not entry points
-    const isEntryPoint = entrypoints.some(ep => {
-      const epName = ep.split("/").pop()?.replace(".tsx", ".js") ?? "";
-      return name === epName;
-    });
-
-    if (!isEntryPoint) {
-      sharedChunks.push(name);
+    const islandKey = entryToIslandKey.get(name);
+    if (islandKey) {
+      // This is an entry point output — map directly to its island
+      islandOutputs.set(islandKey, content);
+    } else {
+      // This is a shared chunk (React, ReactDOM, etc.)
+      sharedChunks.set(name, content);
     }
   }
 
-  return { outputs, sharedChunks };
+  return { islandOutputs, sharedChunks };
 }
 
 async function buildIslandBundle(
@@ -710,15 +719,9 @@ async function buildIslandBundle(
   exportName: string,
   options: { minify?: boolean; development?: boolean } = {},
 ) {
-  const { outputs } = await buildAllIslandBundles(root, [{ source, exportName }], options);
-  // Return the first entry output (the island itself, not shared chunks)
-  for (const [name, content] of outputs) {
-    if (!name.startsWith("chunk-")) {
-      return content;
-    }
-  }
-  // Fallback: return whatever we have
-  return [...outputs.values()][0] || "";
+  const key = `${source}#${exportName}`;
+  const { islandOutputs } = await buildAllIslandBundles(root, [{ source, exportName }], options);
+  return islandOutputs.get(key) || "";
 }
 
 async function buildIslandModule(root: string, source: string, exportName: string) {
@@ -852,68 +855,42 @@ export async function buildApp({
   const islandList = [...islands.values()];
 
   // Build all islands together with splitting for shared React chunk
-  const { outputs, sharedChunks } = await buildAllIslandBundles(projectRoot, islandList, {
+  const { islandOutputs, sharedChunks } = await buildAllIslandBundles(projectRoot, islandList, {
     minify,
     development: false,
   });
 
   // Write shared chunks (React, ReactDOM shared across islands)
   const sharedChunkPaths: string[] = [];
-  for (const chunkName of sharedChunks) {
-    const content = outputs.get(chunkName);
-    if (content) {
-      const publicPath = `/_meiden/islands/${chunkName}`;
-      const outputPath = join(outputRoot, "_meiden", "islands", chunkName);
-      mkdirSync(resolve(outputPath, ".."), { recursive: true });
-      writeFileIfChanged(outputPath, content);
-      sharedChunkPaths.push(publicPath);
+  for (const [chunkName, content] of sharedChunks) {
+    const publicPath = `/_meiden/islands/${chunkName}`;
+    const outputPath = join(outputRoot, "_meiden", "islands", chunkName);
+    mkdirSync(resolve(outputPath, ".."), { recursive: true });
+    writeFileIfChanged(outputPath, content);
+    sharedChunkPaths.push(publicPath);
 
-      assets.push({
-        name: `/_meiden/islands/${chunkName}`,
-        size: Buffer.byteLength(content),
-        type: "shared",
-      });
-    }
+    assets.push({
+      name: `/_meiden/islands/${chunkName}`,
+      size: Buffer.byteLength(content),
+      type: "shared",
+    });
   }
 
   // Write island entry bundles and build manifest
-  for (const island of islandList) {
-    const key = `${island.source}#${island.exportName}`;
-    // Find the entry output for this island
-    const islandEntryName = `island-${hash(`${island.source}:${island.exportName}`)}.js`;
+  for (const [islandKey, content] of islandOutputs) {
+    const fileName = `${hash(`${islandKey}:${content}`)}.js`;
+    const publicPath = `/_meiden/islands/${fileName}`;
+    const outputPath = join(outputRoot, "_meiden", "islands", fileName);
 
-    // Try to find by matching the entry point pattern
-    let entryContent: string | undefined;
-    let entryName: string | undefined;
+    mkdirSync(resolve(outputPath, ".."), { recursive: true });
+    writeFileIfChanged(outputPath, content);
+    manifest[islandKey] = publicPath;
 
-    for (const [name, content] of outputs) {
-      // Skip shared chunks
-      if (sharedChunks.includes(name)) continue;
-      // The first non-shared chunk that matches our island
-      if (!entryContent) {
-        entryContent = content;
-        entryName = name;
-      }
-    }
-
-    if (entryContent && entryName) {
-      const fileName = `${hash(`${key}:${entryContent}`)}.js`;
-      const publicPath = `/_meiden/islands/${fileName}`;
-      const outputPath = join(outputRoot, "_meiden", "islands", fileName);
-
-      mkdirSync(resolve(outputPath, ".."), { recursive: true });
-      writeFileIfChanged(outputPath, entryContent);
-      manifest[key] = publicPath;
-
-      assets.push({
-        name: `/_meiden/islands/${fileName}`,
-        size: Buffer.byteLength(entryContent),
-        type: "island",
-      });
-
-      // Remove this output so we don't reuse it for another island
-      outputs.delete(entryName);
-    }
+    assets.push({
+      name: `/_meiden/islands/${fileName}`,
+      size: Buffer.byteLength(content),
+      type: "island",
+    });
   }
 
   const runtimeContent = createIslandRuntime(manifest);
