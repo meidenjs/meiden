@@ -355,8 +355,10 @@ function parseImportedNames(importClause: string) {
  * This prevents the "flash of empty content" — users see the rendered
  * component immediately, then the client hydrates it for interactivity.
  *
- * If the real component crashes during SSR (e.g. browser-only code at
- * the top level), it falls back to an empty placeholder and logs the error.
+ * If the real component crashes during SSR (e.g. browser-only code like
+ * accessing `window` at the top level, or throwing during render), the
+ * error is caught by a React Error Boundary and the island falls back
+ * to an empty placeholder. Errors are logged to the server console.
  */
 function createIslandProxy(root: string, sourcePath: string, exportNames: string[]) {
   const tmpDir = join(root, ".meiden", "server");
@@ -369,26 +371,50 @@ function createIslandProxy(root: string, sourcePath: string, exportNames: string
   const content = `import React from "react";
 import * as IslandModule from "${absolutePath}";
 
+/**
+ * React Error Boundary that catches rendering errors inside islands.
+ * When an island crashes during SSR (e.g. browser-only code), this
+ * catches the error at the render phase — not just createElement.
+ */
+class IslandErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false };
+  }
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+  componentDidCatch(error) {
+    console.error("[meiden] SSR failed for island " + this.props.islandId + ":", error);
+  }
+  render() {
+    if (this.state.hasError) {
+      return React.createElement("div", {
+        "data-meiden-island": this.props.islandSource,
+        "data-meiden-export": this.props.islandExport,
+        "data-meiden-props": this.props.islandProps,
+      });
+    }
+    return this.props.children;
+  }
+}
+
 ${uniqueExports.map(exportName => {
   const functionName = exportName === "default" ? "MeidenDefaultIsland" : exportName;
   const componentAccess = exportName === "default" ? "IslandModule.default" : `IslandModule.${exportName}`;
   const declaration = `function ${functionName}(props = {}) {
   const islandProps = encodeURIComponent(JSON.stringify(props ?? {}));
-  try {
-    const Component = ${componentAccess};
-    return React.createElement("div", {
-      "data-meiden-island": "${source}",
-      "data-meiden-export": "${exportName}",
-      "data-meiden-props": islandProps,
-    }, React.createElement(Component, props));
-  } catch (error) {
-    console.error("[meiden] SSR failed for island ${source}#${exportName}:", error);
-    return React.createElement("div", {
-      "data-meiden-island": "${source}",
-      "data-meiden-export": "${exportName}",
-      "data-meiden-props": islandProps,
-    });
-  }
+  const Component = ${componentAccess};
+  return React.createElement(IslandErrorBoundary, {
+    islandSource: "${source}",
+    islandExport: "${exportName}",
+    islandProps: islandProps,
+    islandId: "${source}#${exportName}",
+  }, React.createElement("div", {
+    "data-meiden-island": "${source}",
+    "data-meiden-export": "${exportName}",
+    "data-meiden-props": islandProps,
+  }, Component ? React.createElement(Component, props) : null));
 }`;
   if (exportName === "default") {
     return `${declaration}\nexport default ${functionName};`;
