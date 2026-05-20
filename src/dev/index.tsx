@@ -885,7 +885,19 @@ async function loadAppModules(root: string, config: MeidenConfig): Promise<AppMo
   const appDir = resolveAppDir(root, config);
 
   if (!existsSync(appDir)) {
-    return loadLegacyModules(root);
+    try {
+      return await loadLegacyModules(root);
+    } catch (legacyError) {
+      // Provide a clear error that lists every path we tried
+      const tried = [
+        `  - ${appDir} (app directory)`,
+        `  - ${join(root, "src", "layout.tsx")} + ${join(root, "src", "index.tsx")} (legacy)`,
+      ];
+      throw new Error(
+        `Could not find app directory or legacy entry files. Tried:\n${tried.join("\n")}\n\n` +
+        `Create an app directory with layout.tsx and page.tsx, or configure meiden.config.ts with appDir.`,
+      );
+    }
   }
 
   const layoutModule = await import(pathToFileURL(createServerModule(root, resolveAppModule(appDir, "layout"))).href);
@@ -895,19 +907,44 @@ async function loadAppModules(root: string, config: MeidenConfig): Promise<AppMo
     throw new Error("Meiden app router projects must export src/app/layout and at least one page.");
   }
 
+  // Load each route module in isolation — a broken page should not
+  // kill the entire server. Failed routes get an error-page component
+  // that renders a 500 when visited.
   const routes = await Promise.all(
     routeFiles.map(async (filePath) => {
-      const pageModule = await import(pathToFileURL(createServerModule(root, filePath)).href);
+      const routePath = toRoutePath(appDir, filePath);
 
-      if (!pageModule.default) {
-        throw new Error(`Meiden page routes must export a default component: ${filePath}`);
+      try {
+        const pageModule = await import(pathToFileURL(createServerModule(root, filePath)).href);
+
+        if (!pageModule.default) {
+          console.warn(`[meiden] Page has no default export: ${filePath}`);
+          return {
+            path: routePath,
+            Page: () => {
+              throw new Error(`Page missing default export: ${filePath}`);
+            },
+            filePath,
+          };
+        }
+
+        return {
+          path: routePath,
+          Page: pageModule.default,
+          filePath,
+        };
+      } catch (error) {
+        // Import-time failure (syntax error, missing dep, etc.)
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[meiden] Failed to load page module ${filePath}: ${message}`);
+        return {
+          path: routePath,
+          Page: () => {
+            throw new Error(`Failed to load page: ${message}`);
+          },
+          filePath,
+        };
       }
-
-      return {
-        path: toRoutePath(appDir, filePath),
-        Page: pageModule.default,
-        filePath,
-      };
     }),
   );
 
@@ -1507,56 +1544,25 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
 
   const app = new Elysia().use(html());
 
-  // Single onBeforeHandle that handles two concerns in order:
-  //   1. Check concurrency limit — if exceeded, return 503 (without incrementing)
-  //   2. Increment counter and mark request as counted in store
-  //   3. Serve static files from public/ if a matching file exists
-  // If onBeforeHandle returns early (static file), we decrement inline
-  // and clear the store flag so onAfterHandle won't double-decrement.
+  // onBeforeHandle: concurrency limiter only.
+  // Static file serving is handled by a catch-all route registered after
+  // all page routes — Elysia only runs onBeforeHandle for matched routes,
+  // so a request for /index.css that has no registered route would skip
+  // onBeforeHandle entirely and get a 404. The catch-all route fixes this.
   app.onBeforeHandle(({ request, store }) => {
-    // 1. Concurrency check — reject before counting
+    // Concurrency check — reject before counting
     if (inFlightRequests >= MAX_CONCURRENT_REQUESTS) {
       const url = new URL(request.url);
       console.warn("[meiden] 503 Too Many Requests on " + url.pathname + " (concurrent limit: " + MAX_CONCURRENT_REQUESTS + ")");
       return new Response("Too Many Requests", { status: 503, headers: { "Retry-After": "1" } });
     }
 
-    // 2. Count this request
+    // Count this request
     inFlightRequests++;
     (store as any).__meiden_counted = true;
-
-    // 3. Static file serving from public/
-    if (hasPublicDir) {
-      const url = new URL(request.url);
-      const pathname = url.pathname;
-
-      // Never serve from public/ for internal API routes
-      if (!pathname.startsWith("/_meiden/")) {
-        const cleanPath = pathname.replace(/^\/+/, "");
-        const candidateFile = resolve(publicDir, cleanPath);
-
-        // Cross-platform path traversal check:
-        // relative() returns a path like "foo/bar.txt" for files inside publicDir,
-        // or "../escape.txt" for files outside. We reject anything that escapes.
-        const rel = relative(publicDir, candidateFile);
-        const isWithinPublic = rel && !rel.startsWith("..") && !isAbsolute(rel);
-
-        if (isWithinPublic && existsSync(candidateFile) && statSync(candidateFile).isFile()) {
-          // Decrement inline since onAfterHandle may not fire for
-          // onBeforeHandle early returns
-          inFlightRequests--;
-          (store as any).__meiden_counted = false;
-          return new Response(Bun.file(candidateFile), {
-            headers: { "content-type": getContentType(candidateFile) },
-          });
-        }
-      }
-    }
   });
 
   // Decrement only if this request was counted and not already decremented.
-  // The store flag prevents double-decrement if onAfterHandle fires after
-  // onBeforeHandle already decremented for an early-returned static file.
   app.onAfterHandle(({ store }) => {
     if ((store as any).__meiden_counted) {
       inFlightRequests--;
@@ -1611,6 +1617,34 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
       }
     });
   }
+
+  // Catch-all route: serve static files from public/, or return 404.
+  // This MUST be registered after all page routes so that specific routes
+  // take priority. Elysia's onBeforeHandle only fires for matched routes,
+  // so a request like /index.css (which has no registered route) would
+  // previously skip the middleware and get a 404. The catch-all ensures
+  // every request matches at least one route, so the concurrency counter
+  // and static file serving both work correctly.
+  app.get("/*", ({ request }) => {
+    if (hasPublicDir) {
+      const url = new URL(request.url);
+      const pathname = url.pathname;
+      const cleanPath = pathname.replace(/^\/+/, "");
+      const candidateFile = resolve(publicDir, cleanPath);
+
+      // Cross-platform path traversal check
+      const rel = relative(publicDir, candidateFile);
+      const isWithinPublic = rel && !rel.startsWith("..") && !isAbsolute(rel);
+
+      if (isWithinPublic && existsSync(candidateFile) && statSync(candidateFile).isFile()) {
+        return new Response(Bun.file(candidateFile), {
+          headers: { "content-type": getContentType(candidateFile) },
+        });
+      }
+    }
+
+    return new Response("Not Found", { status: 404 });
+  });
 
   app.listen(port);
 
