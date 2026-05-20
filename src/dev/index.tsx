@@ -768,9 +768,11 @@ function createServerModule(root: string, filePath: string) {
         const safeFrom = escapeJsString(relative(root, realPath).replaceAll("\\", "/"));
         const errMsg = `[meiden] Cannot resolve import ${safeSpecifier} from ${safeFrom}`;
 
-        // Generate a unique stub proxy variable for each binding
+        // Generate a unique stub proxy variable for each binding.
+        // Use imp.start (byte offset of the import in the source) to avoid
+        // collisions when multiple broken imports exist in the same file.
         const stubDecl = imp.localBindings.map((binding, i) => {
-          const stubVar = `__meiden_stub_${i}`;
+          const stubVar = `__meiden_stub_${imp.start}_${i}`;
           const localName = binding.localName;
 
           if (binding.kind === "namespace") {
