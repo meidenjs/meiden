@@ -658,11 +658,13 @@ try {
 }
 
 /**
- * React Error Boundary that catches rendering errors inside islands
- * during React's reconciliation/render phase (server-side renderToString
- * supports Error Boundaries in React 18). This catches errors that occur
- * when a component throws during render — for example, accessing browser
- * globals inside JSX that isn't guarded by typeof checks.
+ * React Error Boundary for island rendering errors (best-effort).
+ * React 18's server-side renderToString supports Error Boundaries, so
+ * this can catch component-thrown errors during render in many cases.
+ * However, this is not a guarantee — some errors (e.g. in lifecycle
+ * methods, or errors that occur outside React's error handling) may
+ * still propagate. The primary fallback is the import-time try/catch
+ * above; this boundary is a secondary safety net for render errors.
  *
  * Import-time failures (top-level window access, etc.) are handled by
  * the top-level await try/catch above, not by this boundary.
@@ -1073,7 +1075,7 @@ async function buildIslandModule(root: string, source: string, exportName: strin
 // ─── Layout & Route Rendering ──────────────────────────────────────
 
 export function createLayoutWrapper(RootLayout: AppModules["RootLayout"]) {
-  return function LayoutWrapper({ Page }: LayoutWrapperProps) {
+  return function LayoutWrapper({ Page }: LayoutWrapperProps): any {
     return <RootLayout><Page /></RootLayout>;
   };
 }
@@ -1452,7 +1454,13 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
 
         set.status = 500;
         const message = error instanceof Error ? error.message : "Internal Server Error";
-        return `<!DOCTYPE html><html><body><h1>500 - Server Error</h1><pre>${message}</pre></body></html>`;
+        // Escape error message for safe HTML embedding (even in dev)
+        const safeMessage = message
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;");
+        return `<!DOCTYPE html><html><body><h1>500 - Server Error</h1><pre>${safeMessage}</pre></body></html>`;
       }
     });
   }
