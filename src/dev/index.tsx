@@ -734,7 +734,7 @@ function createServerModule(root: string, filePath: string) {
       // of leaving a broken import that would crash the entire dev server.
       // Non-relative imports (node_modules, built-ins) are left as-is.
       if (imp.specifier.startsWith(".")) {
-        const stubComment = `/* [meiden] stub: unresolvable import "${imp.specifier}" */"`;
+        const stubComment = `/* [meiden] stub: unresolvable import "${imp.specifier}" */`;
         replacements.push({ start: imp.start, end: imp.end, text: stubComment });
       }
       continue;
@@ -1433,32 +1433,15 @@ export function startProductionServer({ root, outDir = "dist", port = 3000 }: Pr
 // ─── Dev Server ────────────────────────────────────────────────────
 
 /**
- * Simple concurrency limiter to prevent the dev server from being
- * overwhelmed by too many simultaneous requests. Bun's HTTP server
- * can become unresponsive under heavy concurrent load (200+ simultaneous
- * connections). This middleware tracks in-flight requests and returns
- * 503 when the limit is exceeded, giving the server breathing room.
+ * Concurrency limiter to prevent the dev server from being overwhelmed
+ * by too many simultaneous requests. Bun's HTTP server can become
+ * unresponsive under heavy concurrent load (200+ simultaneous connections).
+ *
+ * The counter is incremented/decremented via Elysia lifecycle hooks
+ * (onBeforeHandle/onAfterHandle/onError) in startServer().
  */
 const MAX_CONCURRENT_REQUESTS = 100;
 let inFlightRequests = 0;
-
-function withConcurrencyLimit(handler: Function) {
-  return async (...args: any[]) => {
-    if (inFlightRequests >= MAX_CONCURRENT_REQUESTS) {
-      const request = args[0]?.request ?? args[0];
-      const url = request?.url ? new URL(request.url).pathname : "/";
-      console.warn("[meiden] 503 Too Many Requests on " + url + " (concurrent limit: " + MAX_CONCURRENT_REQUESTS + ")");
-      return new Response("Too Many Requests", { status: 503, headers: { "Retry-After": "1" } });
-    }
-
-    inFlightRequests++;
-    try {
-      return await handler(...args);
-    } finally {
-      inFlightRequests--;
-    }
-  };
-}
 
 export async function startServer({ root, port = 3000 }: StartServerOptions) {
   const projectRoot = resolve(root);
@@ -1471,38 +1454,49 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
 
   const app = new Elysia().use(html());
 
-  // Serve static files from public/ directory.
-  // This must be registered before page routes so that
-  // /favicon.ico, /images/*, etc. are served from disk
-  // rather than hitting the 404 handler.
-  if (hasPublicDir) {
-    app.get("/*", ({ request }) => {
-      const startedAt = performance.now();
+  // Serve static files from public/ and enforce concurrency limits
+  // using Elysia's onBeforeHandle lifecycle hook. This runs BEFORE
+  // any route handler, so static files take priority over page routes,
+  // and we can reject requests when the server is overloaded.
+  app.onBeforeHandle(({ request }) => {
+    // --- Concurrency limiter ---
+    if (inFlightRequests >= MAX_CONCURRENT_REQUESTS) {
+      const url = new URL(request.url);
+      console.warn("[meiden] 503 Too Many Requests on " + url.pathname + " (concurrent limit: " + MAX_CONCURRENT_REQUESTS + ")");
+      return new Response("Too Many Requests", { status: 503, headers: { "Retry-After": "1" } });
+    }
+
+    // --- Static file serving from public/ ---
+    if (hasPublicDir) {
       const url = new URL(request.url);
       const pathname = url.pathname;
 
       // Never serve from public/ for internal API routes
-      if (pathname.startsWith("/_meiden/")) {
-        return undefined as any;
-      }
+      if (!pathname.startsWith("/_meiden/")) {
+        // Prevent path traversal
+        const cleanPath = pathname.replace(/^\/+/, "");
+        const candidateFile = resolve(publicDir, cleanPath);
 
-      // Prevent path traversal: resolve and check the file is within publicDir
-      const cleanPath = pathname.replace(/^\/+/, "");
-      const candidateFile = resolve(publicDir, cleanPath);
-      if (!candidateFile.startsWith(publicDir + "/") && candidateFile !== publicDir) {
-        return undefined as any;
+        if (candidateFile.startsWith(publicDir + "/") || candidateFile === publicDir) {
+          if (existsSync(candidateFile) && statSync(candidateFile).isFile()) {
+            return new Response(Bun.file(candidateFile), {
+              headers: { "content-type": getContentType(candidateFile) },
+            });
+          }
+        }
       }
+    }
+  });
 
-      if (existsSync(candidateFile) && statSync(candidateFile).isFile()) {
-        logRequest(request.method, pathname, 200, startedAt);
-        return new Response(Bun.file(candidateFile), {
-          headers: { "content-type": getContentType(candidateFile) },
-        });
-      }
+  // Track in-flight requests for concurrency limiting.
+  // We increment after onBeforeHandle (which already checked the limit)
+  // and decrement in a final onAfterHandle/onError hook.
+  app.onAfterHandle(() => { inFlightRequests--; });
+  app.onError(() => { inFlightRequests--; });
 
-      return undefined as any;
-    });
-  }
+  // The increment happens at the start of each request cycle.
+  // We use a separate onBeforeHandle that runs after the check above.
+  app.onBeforeHandle(() => { inFlightRequests++; });
 
   // Island runtime — always available so that pages with islands can
   // request it on demand. The HTML injection is already conditional
@@ -1546,7 +1540,7 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
     });
   }
 
-  const server = app.listen(port);
+  app.listen(port);
 
-  return server;
+  return app;
 }
