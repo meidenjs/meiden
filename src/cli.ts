@@ -1,20 +1,11 @@
 import { buildApp, startProductionServer, startServer } from "./dev";
+import { colors, color } from "./runtime/utils";
 import { networkInterfaces } from "node:os";
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const args = process.argv.slice(2);
-const colors = {
-  cyan: "\x1b[36m",
-  dim: "\x1b[2m",
-  green: "\x1b[32m",
-  reset: "\x1b[0m",
-};
-
-function color(value: string | number, ansi: string) {
-  return `${ansi}${value}${colors.reset}`;
-}
 
 type Command = "dev" | "build" | "start";
 

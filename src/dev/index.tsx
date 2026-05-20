@@ -15,7 +15,16 @@ import {
 } from "node:fs";
 import { dirname, extname, join, relative, resolve } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
-import { injectIslandRuntime, getContentType } from "../runtime/utils";
+import {
+  injectIslandRuntime,
+  getContentType,
+  getContentTypeMapForServer,
+  colors,
+  color,
+  statusColor,
+  formatDuration,
+  logRequest,
+} from "../runtime/utils";
 
 type Component<Props = Record<string, unknown>> = (props: Props) => any;
 
@@ -72,16 +81,12 @@ interface IslandReference {
   exportName: string;
 }
 
+// ─── Constants ──────────────────────────────────────────────────────
+
 const moduleExtensions = [".tsx", ".ts", ".jsx", ".js"];
 const configExtensions = [".ts", ".js", ".mjs", ".mts", ".cjs"];
 const routeFilePattern = /(^|\/)page\.(tsx|ts|jsx|js)$/;
-const contentTypes: Record<string, string> = {
-  ".css": "text/css; charset=utf-8",
-  ".html": "text/html; charset=utf-8",
-  ".js": "application/javascript; charset=utf-8",
-  ".json": "application/json; charset=utf-8",
-  ".svg": "image/svg+xml",
-};
+
 const reactHooks = new Set([
   "useState",
   "useEffect",
@@ -98,60 +103,10 @@ const reactHooks = new Set([
   "useOptimistic",
   "useActionState",
 ]);
+
 const browserGlobals = new Set(["window", "document", "localStorage", "sessionStorage", "navigator"]);
-const colors = {
-  cyan: "\x1b[36m",
-  dim: "\x1b[2m",
-  green: "\x1b[32m",
-  red: "\x1b[31m",
-  reset: "\x1b[0m",
-  yellow: "\x1b[33m",
-};
 
-function color(value: string | number, ansi: string) {
-  return `${ansi}${value}${colors.reset}`;
-}
-
-function statusColor(status: number) {
-  if (status >= 500) {
-    return colors.red;
-  }
-
-  if (status >= 400) {
-    return colors.yellow;
-  }
-
-  return colors.green;
-}
-
-function formatDuration(start: number) {
-  const duration = performance.now() - start;
-
-  if (duration < 1) {
-    return `${Math.round(duration * 1000)}us`;
-  }
-
-  return duration < 10 ? `${duration.toFixed(2)}ms` : `${duration.toFixed(1)}ms`;
-}
-
-function escapeHtml(value: string) {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
-}
-
-export function logRequest(method: string, path: string, status: number, startedAt: number) {
-  console.log(
-    [
-      color(status, statusColor(status)),
-      color(method.padEnd(4), colors.dim),
-      path.padEnd(8),
-      color(formatDuration(startedAt).padStart(6), colors.dim),
-    ].join("  "),
-  );
-}
+// ─── Utility Functions ──────────────────────────────────────────────
 
 function hash(value: string) {
   return createHash("sha1").update(value).digest("hex").slice(0, 12);
@@ -171,6 +126,18 @@ function writeFileIfChanged(filePath: string, content: string) {
   }
 
   writeFileSync(filePath, content);
+}
+
+/**
+ * Escape a string value for safe embedding inside a JavaScript template
+ * literal or double-quoted string in generated code.
+ */
+function escapeJsString(value: string) {
+  return value
+    .replaceAll("\\", "\\\\")
+    .replaceAll('"', '\\"')
+    .replaceAll("`", "\\`")
+    .replaceAll("$", "\\$");
 }
 
 function resolveAppModule(srcDir: string, name: string) {
@@ -215,6 +182,8 @@ function resolveImport(fromFile: string, specifier: string) {
   return undefined;
 }
 
+// ─── AST Parsing & Analysis ────────────────────────────────────────
+
 function parseModule(filePath: string) {
   const source = readFileSync(filePath, "utf8");
 
@@ -229,6 +198,38 @@ function hasUseClientDirective(program: any) {
   return program.body.some((statement: any) => {
     return statement.type === "ExpressionStatement" && statement.expression?.value === "use client";
   });
+}
+
+/**
+ * Walk the AST with parent tracking. The visitor receives (node, parent, key)
+ * so it can make context-aware decisions about identifier usage.
+ */
+function walkAstWithParent(
+  node: any,
+  parent: any,
+  key: string | null,
+  visit: (node: any, parent: any, key: string | null) => void,
+) {
+  if (!node || typeof node !== "object") {
+    return;
+  }
+
+  visit(node, parent, key);
+
+  const keys = visitorKeys[node.type] ?? [];
+
+  for (const childKey of keys) {
+    const child = node[childKey];
+
+    if (Array.isArray(child)) {
+      for (const item of child) {
+        walkAstWithParent(item, node, childKey, visit);
+      }
+      continue;
+    }
+
+    walkAstWithParent(child, node, childKey, visit);
+  }
 }
 
 function walkAst(node: any, visit: (node: any) => void) {
@@ -247,7 +248,6 @@ function walkAst(node: any, visit: (node: any) => void) {
       for (const item of child) {
         walkAst(item, visit);
       }
-
       continue;
     }
 
@@ -278,6 +278,14 @@ function getReactHookAliases(program: any) {
   return { aliases, namespaceAliases };
 }
 
+/**
+ * Determine if a module is a client module by checking for:
+ * 1. "use client" directive
+ * 2. React hook usage (call expressions)
+ * 3. JSX event handlers (onClick, etc.)
+ * 4. Browser global references (context-aware: excludes typeof guards,
+ *    variable declarations, and property keys)
+ */
 function isClientModule(filePath: string) {
   const { program } = parseModule(filePath);
 
@@ -293,6 +301,7 @@ function isClientModule(filePath: string) {
       return;
     }
 
+    // React hook call: useState(...), React.useState(...)
     if (node.type === "CallExpression") {
       if (node.callee?.type === "Identifier" && aliases.has(node.callee.name)) {
         client = true;
@@ -311,6 +320,7 @@ function isClientModule(filePath: string) {
       }
     }
 
+    // JSX event handler: onClick={...}
     if (
       node.type === "JSXAttribute" &&
       node.name?.type === "JSXIdentifier" &&
@@ -319,62 +329,250 @@ function isClientModule(filePath: string) {
       client = true;
       return;
     }
-
-    if (node.type === "Identifier" && browserGlobals.has(node.name)) {
-      client = true;
-    }
   });
+
+  // Browser global check — context-aware to avoid false positives.
+  // We use parent-tracking to exclude:
+  //   - `typeof window !== "undefined"` (SSR guard pattern)
+  //   - Variable declarations like `const window = ...`
+  //   - Property keys like `obj.window`
+  //   - Import specifiers
+  if (!client) {
+    const definingNames = new Set<string>();
+
+    // First pass: collect all names that are defined (declared) in this module
+    walkAst(program, (node) => {
+      if (node.type === "VariableDeclarator" && node.id?.type === "Identifier") {
+        definingNames.add(node.id.name);
+      }
+      if (node.type === "FunctionDeclaration" && node.id?.type === "Identifier") {
+        definingNames.add(node.id.name);
+      }
+      if (node.type === "ImportSpecifier" && node.local?.type === "Identifier") {
+        definingNames.add(node.local.name);
+      }
+      if (node.type === "ImportDefaultSpecifier" && node.local?.type === "Identifier") {
+        definingNames.add(node.local.name);
+      }
+      if (node.type === "ImportNamespaceSpecifier" && node.local?.type === "Identifier") {
+        definingNames.add(node.local.name);
+      }
+      // Function parameters
+      if (node.type === "Identifier" && node.typeAnnotation) {
+        // Identifier with type annotation in parameter position
+      }
+    });
+
+    // Collect function parameter names
+    walkAstWithParent(program, null, null, (node, parent, parentKey) => {
+      if (
+        node.type === "Identifier" &&
+        (parentKey === "params" || parentKey === "rest")
+      ) {
+        definingNames.add(node.name);
+      }
+    });
+
+    // Second pass: check browser global references with context
+    walkAstWithParent(program, null, null, (node, parent, parentKey) => {
+      if (client) return;
+
+      if (node.type !== "Identifier" || !browserGlobals.has(node.name)) {
+        return;
+      }
+
+      // Skip if this identifier is being defined (shadowed variable)
+      if (definingNames.has(node.name)) {
+        return;
+      }
+
+      // Skip if inside `typeof window` — this is an SSR guard, not a browser dependency
+      if (
+        parent?.type === "UnaryExpression" &&
+        parent.operator === "typeof"
+      ) {
+        return;
+      }
+
+      // Skip property keys: `obj.window` — the Identifier is the property, not the object
+      // In MemberExpression, the property is in .property, not .object
+      if (parent?.type === "MemberExpression" && parentKey === "property" && !parent.computed) {
+        return;
+      }
+
+      // Skip if it's a property key in an object literal: `{ window: 123 }`
+      if (parent?.type === "Property" && parentKey === "key" && !parent.computed) {
+        return;
+      }
+
+      // Skip if it's a shorthand property value that shadows: `{ window }` where window is a local variable
+      if (parent?.type === "Property" && parent.shorthand) {
+        // This could be a destructuring pattern — ambiguous. Only flag if not in defining names.
+        if (definingNames.has(node.name)) {
+          return;
+        }
+      }
+
+      // Skip export names: `export { window }`
+      if (parent?.type === "ExportSpecifier") {
+        return;
+      }
+
+      // If we get here, it's a genuine browser global reference
+      client = true;
+    });
+  }
 
   return client;
 }
 
-function parseImportedNames(importClause: string) {
-  const names = new Set<string>();
-  const defaultMatch = importClause.match(/^\s*([A-Za-z_$][\w$]*)/);
-  const namedMatch = importClause.match(/\{([^}]+)\}/);
+// ─── Import Analysis (AST-based) ───────────────────────────────────
 
-  if (defaultMatch) {
-    names.add("default");
-  }
-
-  if (namedMatch) {
-    for (const part of namedMatch[1].split(",")) {
-      const [name] = part.trim().split(/\s+as\s+/);
-
-      if (name) {
-        names.add(name.trim());
-      }
-    }
-  }
-
-  return [...names];
+interface ImportInfo {
+  /** The full original import statement text */
+  statement: string;
+  /** Start offset of the import statement in the source */
+  start: number;
+  /** End offset of the import statement in the source */
+  end: number;
+  /** The module specifier (e.g., "./Counter") */
+  specifier: string;
+  /** Parsed export names imported from this module */
+  importedNames: string[];
 }
 
 /**
+ * Parse all import declarations from a source file using the AST.
+ * This replaces the regex-based approach and correctly handles:
+ * - Namespace imports: `import * as React from "react"`
+ * - Side-effect imports: `import "./styles.css"`
+ * - Multi-line imports
+ * - Import comments
+ */
+function parseImports(filePath: string): ImportInfo[] {
+  const source = readFileSync(filePath, "utf8");
+  const { program } = parseModule(filePath);
+  const imports: ImportInfo[] = [];
+
+  for (const statement of program.body) {
+    if (statement.type !== "ImportDeclaration") {
+      continue;
+    }
+
+    const specifier = statement.source.value;
+    const importedNames: string[] = [];
+
+    for (const spec of statement.specifiers ?? []) {
+      if (spec.type === "ImportDefaultSpecifier") {
+        importedNames.push("default");
+      } else if (spec.type === "ImportSpecifier") {
+        const imported = spec.imported as any;
+        importedNames.push(imported?.name ?? imported?.value ?? spec.local.name);
+      } else if (spec.type === "ImportNamespaceSpecifier") {
+        importedNames.push("*");
+      }
+    }
+
+    imports.push({
+      statement: source.slice(statement.start, statement.end),
+      start: statement.start,
+      end: statement.end,
+      specifier,
+      importedNames,
+    });
+  }
+
+  return imports;
+}
+
+// ─── Island Proxy ──────────────────────────────────────────────────
+
+/**
  * Create an island proxy that renders the real component on the server.
- * This prevents the "flash of empty content" — users see the rendered
- * component immediately, then the client hydrates it for interactivity.
  *
- * If the real component crashes during SSR (e.g. browser-only code like
- * accessing `window` at the top level, or throwing during render), the
- * error is caught by a React Error Boundary and the island falls back
- * to an empty placeholder. Errors are logged to the server console.
+ * Key improvements over the previous version:
+ * - Uses top-level `await import()` with try/catch so that browser-only
+ *   top-level code in island modules is caught at import time (fixes
+ *   import-time failure fallback — Issue #2).
+ * - The IslandErrorBoundary catches render-time failures.
+ * - String interpolation is properly escaped for safe embedding.
+ * - Component functions remain synchronous so React's renderToString works.
+ *
+ * If the real component crashes during import or SSR, the error is
+ * caught and the island falls back to an empty placeholder.
  */
 function createIslandProxy(root: string, sourcePath: string, exportNames: string[]) {
   const tmpDir = join(root, ".meiden", "server");
   mkdirSync(tmpDir, { recursive: true });
 
-  const source = relative(root, sourcePath).replaceAll("\\", "/");
+  const source = escapeJsString(relative(root, sourcePath).replaceAll("\\", "/"));
   const uniqueExports = [...new Set(exportNames.length > 0 ? exportNames : ["default"])];
-  const absolutePath = sourcePath.replaceAll("\\", "/");
+  const absolutePath = escapeJsString(sourcePath.replaceAll("\\", "/"));
 
+  // Synchronous proxy functions that use the module loaded via top-level await.
+  // If import failed, the function returns a placeholder div.
+  const proxyFunctions = uniqueExports.map((rawExportName) => {
+    const exportName = escapeJsString(rawExportName);
+    const functionName = rawExportName === "default" ? "MeidenDefaultIsland" : rawExportName;
+    const componentAccess = rawExportName === "default" ? `islandModule.default` : `islandModule[${JSON.stringify(escapeJsString(rawExportName))}]`;
+
+    return `
+function ${functionName}(props = {}) {
+  const islandProps = encodeURIComponent(JSON.stringify(props ?? {}));
+  const islandAttrs = {
+    "data-meiden-island": "${source}",
+    "data-meiden-export": "${exportName}",
+    "data-meiden-props": islandProps,
+  };
+
+  if (islandLoadError) {
+    return React.createElement("div", islandAttrs);
+  }
+
+  const Component = ${componentAccess};
+  if (!Component) {
+    console.error("[meiden] SSR: export \\"${exportName}\\" not found in island \\"${source}\\"");
+    return React.createElement("div", islandAttrs);
+  }
+
+  return React.createElement(IslandErrorBoundary, {
+    islandSource: "${source}",
+    islandExport: "${exportName}",
+    islandProps: islandProps,
+    islandId: "${source}#${exportName}",
+  }, React.createElement("div", islandAttrs, React.createElement(Component, props)));
+}`;
+  });
+
+  const exports = uniqueExports.map((name) => {
+    const functionName = name === "default" ? "MeidenDefaultIsland" : name;
+    if (name === "default") {
+      return `export default ${functionName};`;
+    }
+    return `export { ${functionName} };`;
+  });
+
+  // Use top-level await with try/catch to handle import-time failures.
+  // If the island module has browser-only top-level code (e.g. accessing
+  // `window`), the dynamic import will throw — but we catch it here,
+  // so the proxy module still loads successfully and falls back to an
+  // empty placeholder during rendering.
   const content = `import React from "react";
-import * as IslandModule from "${absolutePath}";
+
+let islandModule = null;
+let islandLoadError = null;
+
+try {
+  islandModule = await import("${absolutePath}");
+} catch (error) {
+  islandLoadError = error;
+  console.error("[meiden] SSR import failed for island \\"${source}\\":", error);
+}
 
 /**
  * React Error Boundary that catches rendering errors inside islands.
- * When an island crashes during SSR (e.g. browser-only code), this
- * catches the error at the render phase — not just createElement.
+ * When an island crashes during SSR (e.g. browser-only code in render),
+ * this catches the error and renders an empty placeholder.
  */
 class IslandErrorBoundary extends React.Component {
   constructor(props) {
@@ -385,7 +583,7 @@ class IslandErrorBoundary extends React.Component {
     return { hasError: true };
   }
   componentDidCatch(error) {
-    console.error("[meiden] SSR failed for island " + this.props.islandId + ":", error);
+    console.error("[meiden] SSR render failed for island " + this.props.islandId + ":", error);
   }
   render() {
     if (this.state.hasError) {
@@ -399,64 +597,72 @@ class IslandErrorBoundary extends React.Component {
   }
 }
 
-${uniqueExports.map(exportName => {
-  const functionName = exportName === "default" ? "MeidenDefaultIsland" : exportName;
-  const componentAccess = exportName === "default" ? "IslandModule.default" : `IslandModule.${exportName}`;
-  const declaration = `function ${functionName}(props = {}) {
-  const islandProps = encodeURIComponent(JSON.stringify(props ?? {}));
-  const Component = ${componentAccess};
-  return React.createElement(IslandErrorBoundary, {
-    islandSource: "${source}",
-    islandExport: "${exportName}",
-    islandProps: islandProps,
-    islandId: "${source}#${exportName}",
-  }, React.createElement("div", {
-    "data-meiden-island": "${source}",
-    "data-meiden-export": "${exportName}",
-    "data-meiden-props": islandProps,
-  }, Component ? React.createElement(Component, props) : null));
-}`;
-  if (exportName === "default") {
-    return `${declaration}\nexport default ${functionName};`;
-  }
-  return `export ${declaration}`;
-}).join("\n")}
-`;
-  const proxyPath = join(tmpDir, `island-${hash(`${source}:${uniqueExports.join(",")}:${content}`)}.ts`);
+${proxyFunctions.join("\n")}
 
+${exports.join("\n")}
+`;
+
+  const proxyPath = join(tmpDir, `island-${hash(`${source}:${uniqueExports.join(",")}:${content}`)}.ts`);
   writeFileIfChanged(proxyPath, content);
   return proxyPath;
 }
 
+// ─── Server Module (AST-based import rewriting) ────────────────────
+
+/**
+ * Create a server-side version of a page module by rewriting client
+ * component imports to use island proxies instead.
+ *
+ * Uses AST-based transformation instead of regex for reliability.
+ * Correctly handles:
+ * - Namespace imports (`import * as X from "..."`)
+ * - Side-effect imports (`import "..."`)
+ * - Multi-line imports
+ * - Import comments
+ */
 function createServerModule(root: string, filePath: string) {
   const tmpDir = join(root, ".meiden", "server");
   mkdirSync(tmpDir, { recursive: true });
 
   const realPath = toPath(filePath);
   const source = readFileSync(realPath, "utf8");
-  const transformed = source.replace(
-    /import\s+([\s\S]*?)\s+from\s+["']([^"']+)["']/g,
-    (statement, importClause: string, specifier: string) => {
-      const resolvedImport = resolveImport(realPath, specifier);
+  const imports = parseImports(realPath);
 
-      if (!resolvedImport) {
-        return statement;
-      }
+  // Build replacements from end to start so offsets stay valid
+  const replacements: Array<{ start: number; end: number; text: string }> = [];
 
-      if (isClientModule(resolvedImport)) {
-        const proxyPath = createIslandProxy(root, resolvedImport, parseImportedNames(importClause));
-        return statement.replace(specifier, proxyPath);
-      }
+  for (const imp of imports) {
+    const resolvedImport = resolveImport(realPath, imp.specifier);
 
-      return statement.replace(specifier, resolvedImport);
-    },
-  );
-  const result = `import React from "react";\n${transformed}`;
+    if (!resolvedImport) {
+      continue;
+    }
+
+    if (isClientModule(resolvedImport)) {
+      const proxyPath = createIslandProxy(root, resolvedImport, imp.importedNames);
+      // Replace just the specifier part of the import
+      const newStatement = imp.statement.replace(imp.specifier, proxyPath);
+      replacements.push({ start: imp.start, end: imp.end, text: newStatement });
+    } else {
+      // Rewrite relative imports to absolute paths for server-side resolution
+      const newStatement = imp.statement.replace(imp.specifier, resolvedImport);
+      replacements.push({ start: imp.start, end: imp.end, text: newStatement });
+    }
+  }
+
+  // Apply replacements from end to start to preserve offsets
+  let result = source;
+  for (const rep of replacements.sort((a, b) => b.start - a.start)) {
+    result = result.slice(0, rep.start) + rep.text + result.slice(rep.end);
+  }
+
+  result = `import React from "react";\n${result}`;
   const serverPath = join(tmpDir, `route-${hash(`${filePath}:${result}`)}.tsx`);
-
   writeFileIfChanged(serverPath, result);
   return serverPath;
 }
+
+// ─── Config Loading ────────────────────────────────────────────────
 
 async function loadConfig(root: string): Promise<MeidenConfig> {
   for (const extension of configExtensions) {
@@ -520,7 +726,7 @@ async function loadLegacyModules(root: string): Promise<AppModules> {
 
   return {
     RootLayout: layoutModule.default,
-    routes: [{ path: "/", Page: indexModule.default }],
+    routes: [{ path: "/", Page: indexModule.default, filePath: "src/index" }],
   };
 }
 
@@ -560,6 +766,8 @@ async function loadAppModules(root: string, config: MeidenConfig): Promise<AppMo
   };
 }
 
+// ─── SSR Rendering ─────────────────────────────────────────────────
+
 export async function renderReact(root: string, element: unknown, renderer?: (element: any) => string) {
   if (typeof element === "string") {
     return injectIslandRuntime(`<!DOCTYPE html>${element}`, "/_meiden/islands/runtime.js");
@@ -581,6 +789,8 @@ export async function renderReact(root: string, element: unknown, renderer?: (el
   return injectIslandRuntime(`<!DOCTYPE html>${renderToString(element)}`, "/_meiden/islands/runtime.js");
 }
 
+// ─── Island Runtime ────────────────────────────────────────────────
+
 function createIslandRuntime(manifest?: Record<string, string>) {
   const manifestSource = JSON.stringify(manifest ?? {});
 
@@ -601,6 +811,8 @@ for (const island of islands) {
 }
 `.trim();
 }
+
+// ─── Build Pipeline ────────────────────────────────────────────────
 
 /**
  * Build all island bundles in a single Bun.build call with code splitting.
@@ -765,6 +977,8 @@ async function buildIslandModule(root: string, source: string, exportName: strin
   }
 }
 
+// ─── Layout & Route Rendering ──────────────────────────────────────
+
 export function createLayoutWrapper(RootLayout: AppModules["RootLayout"]) {
   return function LayoutWrapper({ Page }: LayoutWrapperProps) {
     return <RootLayout><Page /></RootLayout>;
@@ -849,6 +1063,8 @@ function injectSharedChunkScripts(html: string, sharedChunkPaths: string[]): str
 
   return `${html}${scripts}`;
 }
+
+// ─── Build ─────────────────────────────────────────────────────────
 
 export async function buildApp({
   root,
@@ -944,7 +1160,7 @@ export async function buildApp({
     });
   }
 
-  // Build a lightweight static file server instead of bundling React + Elysia
+  // Build a lightweight static file server
   await buildStaticServer(outputRoot, routes);
 
   return {
@@ -955,26 +1171,44 @@ export async function buildApp({
   };
 }
 
+// ─── Static Server Generation ──────────────────────────────────────
+
 /**
  * Build a lightweight production server that serves static files.
  * No React or Elysia bundled — just Bun.serve for static files.
+ *
+ * Uses the unified content-type map from runtime/utils.ts.
+ * Includes safe URL decoding with try/catch for malformed URIs.
  */
 async function buildStaticServer(outDir: string, routes: AppRoute[]) {
+  const contentTypeEntries = Object.entries(getContentTypeMapForServer())
+    .map(([ext, type]) => `  ${JSON.stringify(ext)}: ${JSON.stringify(type)}`)
+    .join(",\n");
+
   const entryContent = `
 const { existsSync, statSync } = require("node:fs");
 const { join, resolve, extname } = require("node:path");
 
 const distRoot = import.meta.dir;
 const contentTypes = {
-  ".css": "text/css; charset=utf-8",
-  ".html": "text/html; charset=utf-8",
-  ".js": "application/javascript; charset=utf-8",
-  ".json": "application/json; charset=utf-8",
-  ".svg": "image/svg+xml",
+${contentTypeEntries}
 };
 
+function safeDecodeURIComponent(encoded) {
+  try {
+    return decodeURIComponent(encoded);
+  } catch {
+    return encoded;
+  }
+}
+
 function resolveBuiltFile(requestPath) {
-  const pathname = decodeURIComponent(new URL(requestPath, "http://meiden.local").pathname);
+  let pathname;
+  try {
+    pathname = safeDecodeURIComponent(new URL(requestPath, "http://meiden.local").pathname);
+  } catch {
+    return undefined;
+  }
   const cleanPath = pathname.replace(/^\\/+/, "");
   const candidates = [
     cleanPath ? join(distRoot, cleanPath) : join(distRoot, "index.html"),
@@ -997,7 +1231,8 @@ Bun.serve({
     const startedAt = performance.now();
     const filePath = resolveBuiltFile(request.url);
     const method = request.method;
-    const pathname = new URL(request.url).pathname;
+    let pathname;
+    try { pathname = new URL(request.url).pathname; } catch { pathname = request.url; }
 
     if (!filePath) {
       const duration = (performance.now() - startedAt).toFixed(1);
@@ -1025,12 +1260,17 @@ console.log("");
   writeFileIfChanged(join(outDir, "server.js"), entryContent);
 }
 
-export function getContentType(filePath: string) {
-  return contentTypes[extname(filePath)] ?? "application/octet-stream";
-}
+// ─── Production Server ─────────────────────────────────────────────
 
 export function resolveBuiltFile(distRoot: string, requestPath: string) {
-  const pathname = decodeURIComponent(new URL(requestPath, "http://meiden.local").pathname);
+  let pathname: string;
+  try {
+    pathname = decodeURIComponent(new URL(requestPath, "http://meiden.local").pathname);
+  } catch {
+    // Malformed URL encoding — treat as not found
+    return undefined;
+  }
+
   const cleanPath = pathname.replace(/^\/+/, "");
   const candidates = [
     cleanPath ? join(distRoot, cleanPath) : join(distRoot, "index.html"),
@@ -1082,6 +1322,8 @@ export function startProductionServer({ root, outDir = "dist", port = 3000 }: Pr
   });
 }
 
+// ─── Dev Server ────────────────────────────────────────────────────
+
 export async function startServer({ root, port = 3000 }: StartServerOptions) {
   const projectRoot = resolve(root);
   const config = await loadConfig(projectRoot);
@@ -1103,19 +1345,21 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
   for (const route of routes) {
     app.get(route.path, async ({ request, set }) => {
       const startedAt = performance.now();
-      const page = <LayoutWrapper Page={route.Page} />;
 
       try {
+        const page = <LayoutWrapper Page={route.Page} />;
         const html = await renderReact(projectRoot, page);
-        const status = Number(set.status) || 200;
-        logRequest(request.method, route.path, status, startedAt);
+        logRequest(request.method, route.path, 200, startedAt);
 
         return html;
-      } catch {
-        const status = Number(set.status) || 200;
-        logRequest(request.method, route.path, status, startedAt);
+      } catch (error) {
+        // Return 500 with error details instead of 200 with raw JSX
+        logRequest(request.method, route.path, 500, startedAt);
+        console.error(`[meiden] SSR error on ${route.path}:`, error);
 
-        return page;
+        set.status = 500;
+        const message = error instanceof Error ? error.message : "Internal Server Error";
+        return `<!DOCTYPE html><html><body><h1>500 - Server Error</h1><pre>${message}</pre></body></html>`;
       }
     });
   }
