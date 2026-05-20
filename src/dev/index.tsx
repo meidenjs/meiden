@@ -730,6 +730,16 @@ function createServerModule(root: string, filePath: string) {
     const resolvedImport = resolveImport(realPath, imp.specifier);
 
     if (!resolvedImport) {
+      // Non-relative imports (react, etc.) — keep as-is
+      if (!imp.specifier.startsWith(".")) {
+        continue;
+      }
+      // Relative import that couldn't be resolved — this is an error.
+      // Stub it out so the server module still loads without crashing.
+      // The missing module will return empty exports at runtime.
+      const stubPath = createStubModule(root, imp.specifier, imp.importedNames);
+      const newStatement = imp.statement.replace(imp.specifier, stubPath);
+      replacements.push({ start: imp.start, end: imp.end, text: newStatement });
       continue;
     }
 
@@ -757,6 +767,35 @@ function createServerModule(root: string, filePath: string) {
   return serverPath;
 }
 
+/**
+ * Create a stub module that exports empty/null values for each requested name.
+ * Used when a relative import can't be resolved — instead of letting the
+ * server module crash at import time, we stub it out so the page still
+ * loads (with the missing component rendering as nothing).
+ */
+function createStubModule(root: string, specifier: string, importNames: string[]): string {
+  const tmpDir = join(root, ".meiden", "server");
+  mkdirSync(tmpDir, { recursive: true });
+
+  const lines: string[] = ["// Auto-generated stub for missing module"];
+
+  for (const name of importNames) {
+    if (name === "default") {
+      lines.push(`export default function Stub() { return null; }`);
+    } else if (name === "*") {
+      // Namespace import — export an empty object
+      lines.push(`export default {};`);
+    } else {
+      lines.push(`export function ${name}() { return null; }`);
+    }
+  }
+
+  const content = lines.join("\n");
+  const stubPath = join(tmpDir, `stub-${hash(specifier)}.ts`);
+  writeFileIfChanged(stubPath, content);
+  return stubPath;
+}
+
 // ─── Config Loading ────────────────────────────────────────────────
 
 async function loadConfig(root: string): Promise<MeidenConfig> {
@@ -769,6 +808,8 @@ async function loadConfig(root: string): Promise<MeidenConfig> {
     }
   }
 
+  // No config found — use defaults (appDir: "src/app")
+  console.log(`[meiden] No config file found, using defaults (appDir: src/app)`);
   return {};
 }
 
@@ -836,7 +877,10 @@ async function loadAppModules(root: string, config: MeidenConfig): Promise<AppMo
   const routeFiles = scanAppRoutes(appDir);
 
   if (!layoutModule.default || routeFiles.length === 0) {
-    throw new Error("Meiden app router projects must export src/app/layout and at least one page.");
+    const details = [];
+    if (!layoutModule.default) details.push("layout.tsx does not export a default component");
+    if (routeFiles.length === 0) details.push("no page.tsx files found");
+    throw new Error(`Meiden app router: ${details.join(" and ")}. Expected app/layout.tsx with a default export and at least one app/**/page.tsx.`);
   }
 
   const routes = await Promise.all(
@@ -844,7 +888,7 @@ async function loadAppModules(root: string, config: MeidenConfig): Promise<AppMo
       const pageModule = await import(pathToFileURL(createServerModule(root, filePath)).href);
 
       if (!pageModule.default) {
-        throw new Error(`Meiden page routes must export a default component: ${filePath}`);
+        throw new Error(`Meiden page must export a default component: ${filePath}\n  → Add "export default function Page() { ... }" to the file.`);
       }
 
       return {
@@ -1057,9 +1101,33 @@ async function buildIslandBundle(
   return islandOutputs.get(key) || "";
 }
 
+// Simple in-memory cache for island bundles in dev mode.
+// Prevents redundant builds when multiple concurrent requests hit
+// the same island endpoint. Cache is invalidated on each server restart
+// (which happens via bun --hot when files change).
+const islandBuildCache = new Map<string, { content: string; timestamp: number }>();
+const ISLAND_CACHE_TTL = 30_000; // 30 seconds
+
 async function buildIslandModule(root: string, source: string, exportName: string) {
+  const cacheKey = `${source}#${exportName}`;
+
+  // Check cache first
+  const cached = islandBuildCache.get(cacheKey);
+  if (cached && (performance.now() - cached.timestamp) < ISLAND_CACHE_TTL) {
+    return new Response(cached.content, {
+      headers: {
+        "content-type": "application/javascript; charset=utf-8",
+      },
+    });
+  }
+
   try {
-    return new Response(await buildIslandBundle(root, source, exportName), {
+    const content = await buildIslandBundle(root, source, exportName);
+
+    // Cache the result
+    islandBuildCache.set(cacheKey, { content, timestamp: performance.now() });
+
+    return new Response(content, {
       headers: {
         "content-type": "application/javascript; charset=utf-8",
       },
@@ -1180,7 +1248,16 @@ export async function buildApp({
   copyPublicDir(join(projectRoot, "public"), outputRoot);
 
   for (const route of routes) {
-    const html = await renderRoute(projectRoot, LayoutWrapper, route);
+    let html: string;
+    try {
+      html = await renderRoute(projectRoot, LayoutWrapper, route);
+    } catch (error) {
+      // If a single route fails to render, create an error page instead
+      // of crashing the entire build
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[meiden] SSR error on ${route.path}:`, message);
+      html = `<!DOCTYPE html><html><body><h1>500 - Server Error</h1><p>This page failed to render during build.</p><pre>${message.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")}</pre></body></html>`;
+    }
     rendered.set(route, html);
 
     for (const island of getIslands(html)) {
@@ -1230,15 +1307,19 @@ export async function buildApp({
     });
   }
 
-  const runtimeContent = createIslandRuntime(manifest);
-  const runtimePath = join(outputRoot, "_meiden", "islands", "runtime.js");
-  mkdirSync(resolve(runtimePath, ".."), { recursive: true });
-  writeFileIfChanged(runtimePath, runtimeContent);
-  assets.push({
-    name: "/_meiden/islands/runtime.js",
-    size: Buffer.byteLength(runtimeContent),
-    type: "runtime",
-  });
+  // Only generate runtime.js if there are islands — no point creating
+  // a hydration runtime for purely static pages
+  if (islands.size > 0) {
+    const runtimeContent = createIslandRuntime(manifest);
+    const runtimePath = join(outputRoot, "_meiden", "islands", "runtime.js");
+    mkdirSync(resolve(runtimePath, ".."), { recursive: true });
+    writeFileIfChanged(runtimePath, runtimeContent);
+    assets.push({
+      name: "/_meiden/islands/runtime.js",
+      size: Buffer.byteLength(runtimeContent),
+      type: "runtime",
+    });
+  }
 
   for (const [route, html] of rendered) {
     // Inject shared chunk scripts into the HTML
@@ -1424,9 +1505,11 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
   const config = await loadConfig(projectRoot);
   const { RootLayout, routes } = await loadAppModules(projectRoot, config);
   const LayoutWrapper = createLayoutWrapper(RootLayout);
+  const publicDir = join(projectRoot, "public");
 
   const app = new Elysia().use(html());
 
+  // Serve static files from public/ directory
   app.get("/_meiden/islands/runtime.js", () => new Response(createIslandRuntime(), {
     headers: {
       "content-type": "application/javascript; charset=utf-8",
@@ -1435,6 +1518,36 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
 
   app.get("/_meiden/islands/:source", ({ params, query }) => {
     return buildIslandModule(projectRoot, decodeURIComponent(params.source), String(query.name ?? "default"));
+  });
+
+  // Serve static files from public/ (must be before route handlers)
+  app.get("/*", ({ request }) => {
+    const url = new URL(request.url);
+    let pathname: string;
+    try {
+      pathname = decodeURIComponent(url.pathname);
+    } catch {
+      return new Response("Bad Request", { status: 400 });
+    }
+
+    const cleanPath = pathname.replace(/^\/+/, "");
+    if (!cleanPath) return undefined as any; // Let route handlers deal with "/"
+
+    const filePath = join(publicDir, cleanPath);
+    const resolved = resolve(filePath);
+
+    // Prevent path traversal
+    if (!resolved.startsWith(publicDir + "/") && resolved !== publicDir) {
+      return undefined as any;
+    }
+
+    if (existsSync(resolved) && statSync(resolved).isFile()) {
+      return new Response(Bun.file(resolved), {
+        headers: { "content-type": getContentType(resolved) },
+      });
+    }
+
+    return undefined as any; // Fall through to route handlers
   });
 
   for (const route of routes) {
