@@ -730,6 +730,13 @@ function createServerModule(root: string, filePath: string) {
     const resolvedImport = resolveImport(realPath, imp.specifier);
 
     if (!resolvedImport) {
+      // For relative imports that can't be resolved, stub them out instead
+      // of leaving a broken import that would crash the entire dev server.
+      // Non-relative imports (node_modules, built-ins) are left as-is.
+      if (imp.specifier.startsWith(".")) {
+        const stubComment = `/* [meiden] stub: unresolvable import "${imp.specifier}" */"`;
+        replacements.push({ start: imp.start, end: imp.end, text: stubComment });
+      }
       continue;
     }
 
@@ -1230,15 +1237,21 @@ export async function buildApp({
     });
   }
 
-  const runtimeContent = createIslandRuntime(manifest);
-  const runtimePath = join(outputRoot, "_meiden", "islands", "runtime.js");
-  mkdirSync(resolve(runtimePath, ".."), { recursive: true });
-  writeFileIfChanged(runtimePath, runtimeContent);
-  assets.push({
-    name: "/_meiden/islands/runtime.js",
-    size: Buffer.byteLength(runtimeContent),
-    type: "runtime",
-  });
+  // Only write runtime.js if there are islands.
+  // When there are no interactive components, the HTML won't include
+  // data-meiden-island attributes, so injectIslandRuntime skips the
+  // script tag — and there's no point shipping an empty runtime.
+  if (islands.size > 0) {
+    const runtimeContent = createIslandRuntime(manifest);
+    const runtimePath = join(outputRoot, "_meiden", "islands", "runtime.js");
+    mkdirSync(resolve(runtimePath, ".."), { recursive: true });
+    writeFileIfChanged(runtimePath, runtimeContent);
+    assets.push({
+      name: "/_meiden/islands/runtime.js",
+      size: Buffer.byteLength(runtimeContent),
+      type: "runtime",
+    });
+  }
 
   for (const [route, html] of rendered) {
     // Inject shared chunk scripts into the HTML
@@ -1419,14 +1432,82 @@ export function startProductionServer({ root, outDir = "dist", port = 3000 }: Pr
 
 // ─── Dev Server ────────────────────────────────────────────────────
 
+/**
+ * Simple concurrency limiter to prevent the dev server from being
+ * overwhelmed by too many simultaneous requests. Bun's HTTP server
+ * can become unresponsive under heavy concurrent load (200+ simultaneous
+ * connections). This middleware tracks in-flight requests and returns
+ * 503 when the limit is exceeded, giving the server breathing room.
+ */
+const MAX_CONCURRENT_REQUESTS = 100;
+let inFlightRequests = 0;
+
+function withConcurrencyLimit(handler: Function) {
+  return async (...args: any[]) => {
+    if (inFlightRequests >= MAX_CONCURRENT_REQUESTS) {
+      const request = args[0]?.request ?? args[0];
+      const url = request?.url ? new URL(request.url).pathname : "/";
+      console.warn("[meiden] 503 Too Many Requests on " + url + " (concurrent limit: " + MAX_CONCURRENT_REQUESTS + ")");
+      return new Response("Too Many Requests", { status: 503, headers: { "Retry-After": "1" } });
+    }
+
+    inFlightRequests++;
+    try {
+      return await handler(...args);
+    } finally {
+      inFlightRequests--;
+    }
+  };
+}
+
 export async function startServer({ root, port = 3000 }: StartServerOptions) {
   const projectRoot = resolve(root);
   const config = await loadConfig(projectRoot);
   const { RootLayout, routes } = await loadAppModules(projectRoot, config);
   const LayoutWrapper = createLayoutWrapper(RootLayout);
 
+  const publicDir = join(projectRoot, "public");
+  const hasPublicDir = existsSync(publicDir);
+
   const app = new Elysia().use(html());
 
+  // Serve static files from public/ directory.
+  // This must be registered before page routes so that
+  // /favicon.ico, /images/*, etc. are served from disk
+  // rather than hitting the 404 handler.
+  if (hasPublicDir) {
+    app.get("/*", ({ request }) => {
+      const startedAt = performance.now();
+      const url = new URL(request.url);
+      const pathname = url.pathname;
+
+      // Never serve from public/ for internal API routes
+      if (pathname.startsWith("/_meiden/")) {
+        return undefined as any;
+      }
+
+      // Prevent path traversal: resolve and check the file is within publicDir
+      const cleanPath = pathname.replace(/^\/+/, "");
+      const candidateFile = resolve(publicDir, cleanPath);
+      if (!candidateFile.startsWith(publicDir + "/") && candidateFile !== publicDir) {
+        return undefined as any;
+      }
+
+      if (existsSync(candidateFile) && statSync(candidateFile).isFile()) {
+        logRequest(request.method, pathname, 200, startedAt);
+        return new Response(Bun.file(candidateFile), {
+          headers: { "content-type": getContentType(candidateFile) },
+        });
+      }
+
+      return undefined as any;
+    });
+  }
+
+  // Island runtime — always available so that pages with islands can
+  // request it on demand. The HTML injection is already conditional
+  // (injectIslandRuntime skips when no data-meiden-island is found),
+  // but the route must exist for pages that DO have islands.
   app.get("/_meiden/islands/runtime.js", () => new Response(createIslandRuntime(), {
     headers: {
       "content-type": "application/javascript; charset=utf-8",
@@ -1450,7 +1531,7 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
       } catch (error) {
         // Return 500 with error details instead of 200 with raw JSX
         logRequest(request.method, route.path, 500, startedAt);
-        console.error(`[meiden] SSR error on ${route.path}:`, error);
+        console.error("[meiden] SSR error on " + route.path + ":", error);
 
         set.status = 500;
         const message = error instanceof Error ? error.message : "Internal Server Error";
@@ -1465,7 +1546,7 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
     });
   }
 
-  app.listen(port);
+  const server = app.listen(port);
 
-  return app;
+  return server;
 }
