@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "bun --hot src/cli.ts dev example",
     "build": "bun run src/cli.ts build example",
-    "start": "bun run src/cli.ts start example"
+    "start": "bun run src/cli.ts start example",
+    "test": "bun test"
   },
   "bin": {
     "meiden": "./bin/meiden"
