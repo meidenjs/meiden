@@ -428,6 +428,13 @@ function isClientModule(filePath: string) {
 
 // ─── Import Analysis (AST-based) ───────────────────────────────────
 
+interface ImportLocalBinding {
+  /** The local variable name in the importing module */
+  localName: string;
+  /** The type of import: "default", "named", or "namespace" */
+  kind: "default" | "named" | "namespace";
+}
+
 interface ImportInfo {
   /** The full original import statement text */
   statement: string;
@@ -443,6 +450,8 @@ interface ImportInfo {
   isNamespace: boolean;
   /** The local binding name for namespace imports (e.g., "Counter" in `import * as Counter`) */
   namespaceLocal?: string;
+  /** Local binding names for each import specifier */
+  localBindings: ImportLocalBinding[];
 }
 
 /**
@@ -482,6 +491,17 @@ function parseImports(filePath: string): ImportInfo[] {
       }
     }
 
+    const localBindings: ImportLocalBinding[] = [];
+    for (const spec of statement.specifiers ?? []) {
+      if (spec.type === "ImportDefaultSpecifier") {
+        localBindings.push({ localName: spec.local?.name ?? "default", kind: "default" });
+      } else if (spec.type === "ImportSpecifier") {
+        localBindings.push({ localName: spec.local?.name ?? "", kind: "named" });
+      } else if (spec.type === "ImportNamespaceSpecifier") {
+        localBindings.push({ localName: spec.local?.name ?? "", kind: "namespace" });
+      }
+    }
+
     imports.push({
       statement: source.slice(statement.start, statement.end),
       start: statement.start,
@@ -490,6 +510,7 @@ function parseImports(filePath: string): ImportInfo[] {
       importedNames,
       isNamespace,
       namespaceLocal,
+      localBindings,
     });
   }
 
@@ -730,19 +751,38 @@ function createServerModule(root: string, filePath: string) {
     const resolvedImport = resolveImport(realPath, imp.specifier);
 
     if (!resolvedImport) {
-      // For relative imports that can't be resolved, generate stub variables
-      // that throw a clear error at runtime instead of leaving a broken
-      // import (which crashes the server) or a silent comment (which leads
-      // to confusing "Foo is not defined" errors).
+      // For relative imports that can't be resolved, generate lazy stub
+      // bindings using Proxy that throw only when accessed (not at module
+      // evaluation time). This prevents `await import(...)` from crashing
+      // the dev server and gives a clear error message when the unresolved
+      // binding is actually used at runtime.
       // Non-relative imports (node_modules, built-ins) are left as-is.
       if (imp.specifier.startsWith(".")) {
-        const stubNames = imp.importedNames.map((n) => {
-          if (n === "default") return `var ${escapeJsString(imp.specifier.replace(/[^a-zA-Z0-9]/g, "_"))}_default`;
-          return `var ${n}`;
-        }).join("; ");
+        // Side-effect imports (no bindings): just remove the statement
+        if (imp.localBindings.length === 0) {
+          replacements.push({ start: imp.start, end: imp.end, text: "" });
+          continue;
+        }
+
         const safeSpecifier = escapeJsString(imp.specifier);
-        const stubCode = `${stubNames}; /* [meiden] unresolvable: "${safeSpecifier}" */; throw new Error("[meiden] Cannot resolve import ${safeSpecifier} from ${escapeJsString(relative(root, realPath).replaceAll("\\", "/"))}");`;
-        replacements.push({ start: imp.start, end: imp.end, text: stubCode });
+        const safeFrom = escapeJsString(relative(root, realPath).replaceAll("\\", "/"));
+        const errMsg = `[meiden] Cannot resolve import ${safeSpecifier} from ${safeFrom}`;
+
+        // Generate a unique stub proxy variable for each binding
+        const stubDecl = imp.localBindings.map((binding, i) => {
+          const stubVar = `__meiden_stub_${i}`;
+          const localName = binding.localName;
+
+          if (binding.kind === "namespace") {
+            // Namespace: Proxy on a plain object (no apply trap needed)
+            return `const ${stubVar} = new Proxy({}, { get: () => { throw new Error("${errMsg}"); } });\nconst ${localName} = ${stubVar};`;
+          }
+
+          // Default and named: Proxy on a function (so it can be called)
+          return `const ${stubVar} = new Proxy(function() {}, { get: () => { throw new Error("${errMsg}"); }, apply: () => { throw new Error("${errMsg}"); } });\nconst ${localName} = ${stubVar};`;
+        }).join("\n");
+
+        replacements.push({ start: imp.start, end: imp.end, text: stubDecl });
       }
       continue;
     }
@@ -1444,10 +1484,12 @@ export function startProductionServer({ root, outDir = "dist", port = 3000 }: Pr
  * by too many simultaneous requests. Bun's HTTP server can become
  * unresponsive under heavy concurrent load (200+ simultaneous connections).
  *
- * The counter is incremented at the very start of onBeforeHandle (before
- * any early-return logic), and decremented in onAfterHandle/onError.
- * If the limit is exceeded, we decrement before returning 503 so the
- * counter stays balanced. This ensures inFlightRequests never goes negative.
+ * The counter is only incremented for requests that pass the concurrency
+ * check. Requests rejected with 503 are never counted, so no decrement
+ * is needed for them. For requests that are counted, we use a per-request
+ * store flag (__meiden_counted) so that onAfterHandle/onError only
+ * decrement once — even if onAfterHandle fires after onBeforeHandle
+ * returns an early response (e.g., a static file).
  */
 const MAX_CONCURRENT_REQUESTS = 100;
 let inFlightRequests = 0;
@@ -1463,24 +1505,23 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
 
   const app = new Elysia().use(html());
 
-  // Single onBeforeHandle that handles three concerns in order:
-  //   1. Increment inFlightRequests FIRST (before any early return)
-  //   2. Check concurrency limit — if exceeded, decrement and return 503
+  // Single onBeforeHandle that handles two concerns in order:
+  //   1. Check concurrency limit — if exceeded, return 503 (without incrementing)
+  //   2. Increment counter and mark request as counted in store
   //   3. Serve static files from public/ if a matching file exists
-  // If none of the above applies, the request flows through to route handlers.
-  // onAfterHandle/onError always decrement because every request that enters
-  // this hook was already counted.
-  app.onBeforeHandle(({ request }) => {
-    // 1. Count this request
-    inFlightRequests++;
-
-    // 2. Concurrency check — if over limit, undo the count and reject
-    if (inFlightRequests > MAX_CONCURRENT_REQUESTS) {
-      inFlightRequests--;
+  // If onBeforeHandle returns early (static file), we decrement inline
+  // and clear the store flag so onAfterHandle won't double-decrement.
+  app.onBeforeHandle(({ request, store }) => {
+    // 1. Concurrency check — reject before counting
+    if (inFlightRequests >= MAX_CONCURRENT_REQUESTS) {
       const url = new URL(request.url);
       console.warn("[meiden] 503 Too Many Requests on " + url.pathname + " (concurrent limit: " + MAX_CONCURRENT_REQUESTS + ")");
       return new Response("Too Many Requests", { status: 503, headers: { "Retry-After": "1" } });
     }
+
+    // 2. Count this request
+    inFlightRequests++;
+    (store as any).__meiden_counted = true;
 
     // 3. Static file serving from public/
     if (hasPublicDir) {
@@ -1499,6 +1540,10 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
         const isWithinPublic = rel && !rel.startsWith("..") && !isAbsolute(rel);
 
         if (isWithinPublic && existsSync(candidateFile) && statSync(candidateFile).isFile()) {
+          // Decrement inline since onAfterHandle may not fire for
+          // onBeforeHandle early returns
+          inFlightRequests--;
+          (store as any).__meiden_counted = false;
           return new Response(Bun.file(candidateFile), {
             headers: { "content-type": getContentType(candidateFile) },
           });
@@ -1507,11 +1552,21 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
     }
   });
 
-  // Always decrement after the request completes — whether success or error.
-  // This is safe because every request that enters onBeforeHandle was
-  // incremented there (unless it was a 503, which already decremented).
-  app.onAfterHandle(() => { inFlightRequests--; });
-  app.onError(() => { inFlightRequests--; });
+  // Decrement only if this request was counted and not already decremented.
+  // The store flag prevents double-decrement if onAfterHandle fires after
+  // onBeforeHandle already decremented for an early-returned static file.
+  app.onAfterHandle(({ store }) => {
+    if ((store as any).__meiden_counted) {
+      inFlightRequests--;
+      (store as any).__meiden_counted = false;
+    }
+  });
+  app.onError(({ store }) => {
+    if ((store as any).__meiden_counted) {
+      inFlightRequests--;
+      (store as any).__meiden_counted = false;
+    }
+  });
 
   // Island runtime — always available so that pages with islands can
   // request it on demand. The HTML injection is already conditional
