@@ -437,8 +437,12 @@ interface ImportInfo {
   end: number;
   /** The module specifier (e.g., "./Counter") */
   specifier: string;
-  /** Parsed export names imported from this module */
+  /** Parsed export names imported from this module. "*" means namespace import. */
   importedNames: string[];
+  /** Whether this is a namespace import (import * as X) */
+  isNamespace: boolean;
+  /** The local binding name for namespace imports (e.g., "Counter" in `import * as Counter`) */
+  namespaceLocal?: string;
 }
 
 /**
@@ -462,6 +466,9 @@ function parseImports(filePath: string): ImportInfo[] {
     const specifier = statement.source.value;
     const importedNames: string[] = [];
 
+    let isNamespace = false;
+    let namespaceLocal: string | undefined;
+
     for (const spec of statement.specifiers ?? []) {
       if (spec.type === "ImportDefaultSpecifier") {
         importedNames.push("default");
@@ -470,6 +477,8 @@ function parseImports(filePath: string): ImportInfo[] {
         importedNames.push(imported?.name ?? imported?.value ?? spec.local.name);
       } else if (spec.type === "ImportNamespaceSpecifier") {
         importedNames.push("*");
+        isNamespace = true;
+        namespaceLocal = spec.local?.name;
       }
     }
 
@@ -479,10 +488,67 @@ function parseImports(filePath: string): ImportInfo[] {
       end: statement.end,
       specifier,
       importedNames,
+      isNamespace,
+      namespaceLocal,
     });
   }
 
   return imports;
+}
+
+/**
+ * Extract the named exports from a module file using the AST.
+ * Used when a namespace import (`import * as X from "..."`) references
+ * a client module — we need to know the actual export names so the
+ * proxy can create valid JS functions for each one instead of the
+ * invalid `function *()`.
+ */
+function getModuleExportNames(filePath: string): string[] {
+  const { program } = parseModule(filePath);
+  const exports: string[] = [];
+
+  for (const statement of program.body) {
+    // export default function ...
+    if (statement.type === "ExportDefaultDeclaration") {
+      exports.push("default");
+    }
+
+    // export function Foo() {}
+    // export const bar = ...
+    // export { foo, bar as baz }
+    if (statement.type === "ExportNamedDeclaration") {
+      if (statement.declaration) {
+        if (statement.declaration.type === "FunctionDeclaration" && statement.declaration.id?.type === "Identifier") {
+          exports.push(statement.declaration.id.name);
+        }
+        if (statement.declaration.type === "ClassDeclaration" && statement.declaration.id?.type === "Identifier") {
+          exports.push(statement.declaration.id.name);
+        }
+        if (statement.declaration.type === "VariableDeclaration") {
+          for (const decl of statement.declaration.declarations ?? []) {
+            if (decl.id?.type === "Identifier") {
+              exports.push(decl.id.name);
+            }
+          }
+        }
+      }
+      if (statement.specifiers) {
+        for (const spec of statement.specifiers) {
+          if (spec.type === "ExportSpecifier") {
+            const exported = spec.exported as any;
+            const name = exported?.name ?? exported?.value;
+            if (name === "default") {
+              exports.push("default");
+            } else if (name) {
+              exports.push(name);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return [...new Set(exports)];
 }
 
 // ─── Island Proxy ──────────────────────────────────────────────────
@@ -494,19 +560,41 @@ function parseImports(filePath: string): ImportInfo[] {
  * - Uses top-level `await import()` with try/catch so that browser-only
  *   top-level code in island modules is caught at import time (fixes
  *   import-time failure fallback — Issue #2).
- * - The IslandErrorBoundary catches render-time failures.
+ * - Namespace imports (`import * as X from "..."`) are resolved to their
+ *   actual export names so the generated proxy contains valid JS identifiers
+ *   instead of the invalid `function *()`.
  * - String interpolation is properly escaped for safe embedding.
  * - Component functions remain synchronous so React's renderToString works.
  *
- * If the real component crashes during import or SSR, the error is
- * caught and the island falls back to an empty placeholder.
+ * If the real component crashes during import, the error is caught by the
+ * top-level try/catch and the island falls back to an empty placeholder.
+ * If it crashes during rendering, the IslandErrorBoundary catches the error
+ * within React's reconciliation and renders the placeholder instead.
  */
 function createIslandProxy(root: string, sourcePath: string, exportNames: string[]) {
   const tmpDir = join(root, ".meiden", "server");
   mkdirSync(tmpDir, { recursive: true });
 
+  // If exportNames contains "*", resolve to actual module exports.
+  // This handles namespace imports like `import * as Counter from "./Counter"`
+  // where "*" would otherwise become an invalid function name.
+  let resolvedExportNames = exportNames;
+  if (exportNames.includes("*")) {
+    const actualExports = getModuleExportNames(sourcePath);
+    if (actualExports.length > 0) {
+      // Replace "*" with the actual exports from the module
+      resolvedExportNames = [
+        ...exportNames.filter(n => n !== "*"),
+        ...actualExports,
+      ];
+    } else {
+      // Fallback: if we can't determine exports, assume default
+      resolvedExportNames = exportNames.filter(n => n !== "*").concat(["default"]);
+    }
+  }
+
   const source = escapeJsString(relative(root, sourcePath).replaceAll("\\", "/"));
-  const uniqueExports = [...new Set(exportNames.length > 0 ? exportNames : ["default"])];
+  const uniqueExports = [...new Set(resolvedExportNames.length > 0 ? resolvedExportNames : ["default"])];
   const absolutePath = escapeJsString(sourcePath.replaceAll("\\", "/"));
 
   // Synchronous proxy functions that use the module loaded via top-level await.
@@ -570,9 +658,14 @@ try {
 }
 
 /**
- * React Error Boundary that catches rendering errors inside islands.
- * When an island crashes during SSR (e.g. browser-only code in render),
- * this catches the error and renders an empty placeholder.
+ * React Error Boundary that catches rendering errors inside islands
+ * during React's reconciliation/render phase (server-side renderToString
+ * supports Error Boundaries in React 18). This catches errors that occur
+ * when a component throws during render — for example, accessing browser
+ * globals inside JSX that isn't guarded by typeof checks.
+ *
+ * Import-time failures (top-level window access, etc.) are handled by
+ * the top-level await try/catch above, not by this boundary.
  */
 class IslandErrorBoundary extends React.Component {
   constructor(props) {
