@@ -13,7 +13,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, extname, join, relative, resolve } from "node:path";
+import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import {
   injectIslandRuntime,
@@ -730,12 +730,19 @@ function createServerModule(root: string, filePath: string) {
     const resolvedImport = resolveImport(realPath, imp.specifier);
 
     if (!resolvedImport) {
-      // For relative imports that can't be resolved, stub them out instead
-      // of leaving a broken import that would crash the entire dev server.
+      // For relative imports that can't be resolved, generate stub variables
+      // that throw a clear error at runtime instead of leaving a broken
+      // import (which crashes the server) or a silent comment (which leads
+      // to confusing "Foo is not defined" errors).
       // Non-relative imports (node_modules, built-ins) are left as-is.
       if (imp.specifier.startsWith(".")) {
-        const stubComment = `/* [meiden] stub: unresolvable import "${imp.specifier}" */`;
-        replacements.push({ start: imp.start, end: imp.end, text: stubComment });
+        const stubNames = imp.importedNames.map((n) => {
+          if (n === "default") return `var ${escapeJsString(imp.specifier.replace(/[^a-zA-Z0-9]/g, "_"))}_default`;
+          return `var ${n}`;
+        }).join("; ");
+        const safeSpecifier = escapeJsString(imp.specifier);
+        const stubCode = `${stubNames}; /* [meiden] unresolvable: "${safeSpecifier}" */; throw new Error("[meiden] Cannot resolve import ${safeSpecifier} from ${escapeJsString(relative(root, realPath).replaceAll("\\", "/"))}");`;
+        replacements.push({ start: imp.start, end: imp.end, text: stubCode });
       }
       continue;
     }
@@ -1437,8 +1444,10 @@ export function startProductionServer({ root, outDir = "dist", port = 3000 }: Pr
  * by too many simultaneous requests. Bun's HTTP server can become
  * unresponsive under heavy concurrent load (200+ simultaneous connections).
  *
- * The counter is incremented/decremented via Elysia lifecycle hooks
- * (onBeforeHandle/onAfterHandle/onError) in startServer().
+ * The counter is incremented at the very start of onBeforeHandle (before
+ * any early-return logic), and decremented in onAfterHandle/onError.
+ * If the limit is exceeded, we decrement before returning 503 so the
+ * counter stays balanced. This ensures inFlightRequests never goes negative.
  */
 const MAX_CONCURRENT_REQUESTS = 100;
 let inFlightRequests = 0;
@@ -1454,49 +1463,55 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
 
   const app = new Elysia().use(html());
 
-  // Serve static files from public/ and enforce concurrency limits
-  // using Elysia's onBeforeHandle lifecycle hook. This runs BEFORE
-  // any route handler, so static files take priority over page routes,
-  // and we can reject requests when the server is overloaded.
+  // Single onBeforeHandle that handles three concerns in order:
+  //   1. Increment inFlightRequests FIRST (before any early return)
+  //   2. Check concurrency limit — if exceeded, decrement and return 503
+  //   3. Serve static files from public/ if a matching file exists
+  // If none of the above applies, the request flows through to route handlers.
+  // onAfterHandle/onError always decrement because every request that enters
+  // this hook was already counted.
   app.onBeforeHandle(({ request }) => {
-    // --- Concurrency limiter ---
-    if (inFlightRequests >= MAX_CONCURRENT_REQUESTS) {
+    // 1. Count this request
+    inFlightRequests++;
+
+    // 2. Concurrency check — if over limit, undo the count and reject
+    if (inFlightRequests > MAX_CONCURRENT_REQUESTS) {
+      inFlightRequests--;
       const url = new URL(request.url);
       console.warn("[meiden] 503 Too Many Requests on " + url.pathname + " (concurrent limit: " + MAX_CONCURRENT_REQUESTS + ")");
       return new Response("Too Many Requests", { status: 503, headers: { "Retry-After": "1" } });
     }
 
-    // --- Static file serving from public/ ---
+    // 3. Static file serving from public/
     if (hasPublicDir) {
       const url = new URL(request.url);
       const pathname = url.pathname;
 
       // Never serve from public/ for internal API routes
       if (!pathname.startsWith("/_meiden/")) {
-        // Prevent path traversal
         const cleanPath = pathname.replace(/^\/+/, "");
         const candidateFile = resolve(publicDir, cleanPath);
 
-        if (candidateFile.startsWith(publicDir + "/") || candidateFile === publicDir) {
-          if (existsSync(candidateFile) && statSync(candidateFile).isFile()) {
-            return new Response(Bun.file(candidateFile), {
-              headers: { "content-type": getContentType(candidateFile) },
-            });
-          }
+        // Cross-platform path traversal check:
+        // relative() returns a path like "foo/bar.txt" for files inside publicDir,
+        // or "../escape.txt" for files outside. We reject anything that escapes.
+        const rel = relative(publicDir, candidateFile);
+        const isWithinPublic = rel && !rel.startsWith("..") && !isAbsolute(rel);
+
+        if (isWithinPublic && existsSync(candidateFile) && statSync(candidateFile).isFile()) {
+          return new Response(Bun.file(candidateFile), {
+            headers: { "content-type": getContentType(candidateFile) },
+          });
         }
       }
     }
   });
 
-  // Track in-flight requests for concurrency limiting.
-  // We increment after onBeforeHandle (which already checked the limit)
-  // and decrement in a final onAfterHandle/onError hook.
+  // Always decrement after the request completes — whether success or error.
+  // This is safe because every request that enters onBeforeHandle was
+  // incremented there (unless it was a 503, which already decremented).
   app.onAfterHandle(() => { inFlightRequests--; });
   app.onError(() => { inFlightRequests--; });
-
-  // The increment happens at the start of each request cycle.
-  // We use a separate onBeforeHandle that runs after the check above.
-  app.onBeforeHandle(() => { inFlightRequests++; });
 
   // Island runtime — always available so that pages with islands can
   // request it on demand. The HTML injection is already conditional
