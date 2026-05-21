@@ -2757,4 +2757,67 @@ export function POST() {
       rmSync(projectRoot, { recursive: true, force: true });
     }
   });
+
+  it("should serve API route instead of page when both exist at same path in production", async () => {
+    const projectRoot = join(tempRoot, "prod-api-priority");
+    const appDir = join(projectRoot, "app");
+
+    mkdirSync(join(appDir, "api", "data"), { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <html><body>{children}</body></html>; }`,
+    );
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <div>Home</div>; }`,
+    );
+    // Page at /api/data — would normally be pre-rendered to HTML
+    writeFileSync(
+      join(appDir, "api", "data", "page.tsx"),
+      `export default function DataPage() { return <div>Data Page Content</div>; }`,
+    );
+    // API route at /api/data — should take priority over the page
+    writeFileSync(
+      join(appDir, "api", "data", "route.ts"),
+      `export function GET() {
+  return new Response(JSON.stringify({ source: "api" }), {
+    headers: { "content-type": "application/json" },
+  });
+}`,
+    );
+    writeFileSync(
+      join(projectRoot, "meiden.config.ts"),
+      `export default { appDir: "app" };`,
+    );
+
+    try {
+      const devModulePath = join(import.meta.dir, "..", "src", "dev", "index.tsx");
+      const { buildApp } = await import(devModulePath);
+      await buildApp({ root: projectRoot });
+
+      const port = prodTestPort++;
+      const { baseUrl, cleanup } = await startProdServer(projectRoot, port);
+
+      try {
+        // /api/data should return the API route JSON, NOT the page HTML
+        const res = await fetchUrl(`${baseUrl}/api/data`);
+        expect(res.status).toBe(200);
+        expect(res.headers.get("content-type")).toContain("application/json");
+        const data = JSON.parse(res.body);
+        expect(data.source).toBe("api");
+
+        // Home page should still work
+        const homeRes = await fetchUrl(`${baseUrl}/`);
+        expect(homeRes.status).toBe(200);
+        expect(homeRes.body).toContain("Home");
+      } finally {
+        cleanup();
+      }
+    } finally {
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
 });
