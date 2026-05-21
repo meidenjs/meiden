@@ -976,6 +976,12 @@ function createServerModule(root: string, filePath: string, stack?: Set<string>,
       }
 
       if (isClientModule(resolvedImport)) {
+        // Register the dependency relationship so that the hot-reload
+        // watcher can find which pages/layouts need re-importing when
+        // this client component (island) changes. Without this edge in
+        // the dependency graph, findDependents() returns empty for
+        // island changes and the page is not re-imported.
+        registerDependency(realPath, resolvedImport);
         const proxyPath = createIslandProxy(root, resolvedImport, imp.importedNames);
         // Replace just the specifier part of the import
         const newStatement = imp.statement.replace(imp.specifier, proxyPath);
