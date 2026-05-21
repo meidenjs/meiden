@@ -815,16 +815,27 @@ function findDependents(sourcePath: string): Set<string> {
  *     page → A → Shared   (Shared removed after A finishes)
  *     page → B → Shared   (Shared not in stack — processed normally)
  *
- * In-progress module map: the `inProgress` map tracks the deterministic
+ * In-progress module map: the `inProgress` map tracks the content-scoped
  * server module path for each file currently being transformed. When a
  * circular import is detected, the cyclic reference uses this path
  * instead of the raw source path. This ensures that even cyclic
  * references point to a Meiden-transformed module (with `import React`,
  * rewritten island proxies, etc.) rather than the unprocessed source.
  *
+ * Content-scoped versioning: the in-progress path includes a hash of the
+ * raw source content (`route-${hash(realPath)}-${hash(source)}.tsx`).
+ * This ensures the path changes across edits, which busts Bun's ESM
+ * module cache. Without this, the path would be stable across edits and
+ * Bun would return a cached (stale) module for cyclic references during
+ * HMR:
+ *
+ *     A → B → A (cycle)
+ *     After editing A: sourceHash changes → new in-progress path
+ *     → Bun loads fresh module instead of cached one
+ *
  * The transformed content is written to both:
- *   1. The deterministic path (for cyclic references)
- *   2. The content-hashed path (for HMR cache-busting)
+ *   1. The content-scoped path (for cyclic references — busts ESM cache)
+ *   2. The content-hashed path (for HMR cache-busting on the outer module)
  * The content-hashed path is returned from the outermost call so the
  * HMR cascade continues to work correctly.
  */
@@ -856,15 +867,30 @@ function createServerModule(root: string, filePath: string, stack?: Set<string>,
   }
   stack.add(realPath);
 
-  // Pre-compute a deterministic server module path and register it
-  // in the in-progress map before recursing into imports. This allows
-  // cyclic references to find a valid server module path even though
-  // the content-hashed path isn't known yet.
-  const deterministicPath = join(tmpDir, `route-${hash(realPath)}.tsx`);
+  // Read source content early to compute a content-scoped hash for the
+  // deterministic path. Including the source hash ensures the cyclic
+  // reference path changes across edits, which busts Bun's ESM module
+  // cache. Without this, the path `route-${hash(realPath)}.tsx` would be
+  // stable across edits and Bun would return the cached (stale) module.
+  const source = readFileSync(realPath, "utf8");
+  const sourceHash = hash(source);
+
+  // Pre-compute a content-scoped deterministic server module path and
+  // register it in the in-progress map before recursing into imports.
+  // This allows cyclic references to find a valid server module path
+  // even though the content-hashed path isn't known yet.
+  //
+  // The path includes the source hash so that when a file is edited,
+  // the deterministic path changes and Bun's ESM cache is bypassed.
+  // This prevents stale cyclic references during HMR:
+  //
+  //   A -> B -> A (cycle)
+  //   After editing A: sourceHash changes -> new deterministic path
+  //   -> Bun loads fresh module instead of cached one
+  const deterministicPath = join(tmpDir, `route-${hash(realPath)}-${sourceHash}.tsx`);
   inProgress.set(realPath, deterministicPath);
 
   try {
-    const source = readFileSync(realPath, "utf8");
     const imports = parseImports(realPath);
 
     // Clear stale dependency edges for this file before re-registering.
@@ -957,11 +983,11 @@ function createServerModule(root: string, filePath: string, stack?: Set<string>,
 
     result = `import React from "react";\n${result}`;
 
-    // Write the transformed content to the deterministic path.
+    // Write the transformed content to the content-scoped path.
     // This path is used by cyclic references (B → A when A → B → A),
     // so it must contain the fully transformed module — not the raw
-    // source. The deterministic path is overwritten on each transform,
-    // so cyclic references always get the latest version.
+    // source. Because the path includes the source hash, it changes
+    // across edits, busting Bun's ESM module cache for cyclic imports.
     writeFileIfChanged(deterministicPath, result);
 
     // Also write to a content-hashed path for HMR cache-busting.
