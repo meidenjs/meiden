@@ -64,7 +64,7 @@ interface MeidenConfig {
 
 interface AppModules {
   RootLayout: Component<{ children: unknown }>;
-  routes: AppRoute[];
+  routes: RouteManifestEntry[];
 }
 
 interface AppRoute {
@@ -73,8 +73,77 @@ interface AppRoute {
   filePath: string;
 }
 
+// ─── Route Manifest Types ───────────────────────────────────────────
+
+/**
+ * The kind of dynamic segment in a route path.
+ * - "static": no dynamic segment (e.g. /about)
+ * - "param": single dynamic segment (e.g. /blog/[slug])
+ * - "wildcard": catch-all segment (e.g. /docs/[...path])
+ */
+type SegmentKind = "static" | "param" | "wildcard";
+
+/**
+ * A single parsed segment of a route pattern.
+ * For `/blog/[slug]` this produces two segments:
+ *   { raw: "blog", kind: "static" }
+ *   { raw: "[slug]", kind: "param", name: "slug" }
+ */
+interface RouteSegment {
+  /** The raw directory name from the file path (e.g. "[slug]", "blog") */
+  raw: string;
+  /** Whether this segment is static, a dynamic param, or a wildcard catch-all */
+  kind: SegmentKind;
+  /** The param name for dynamic/wildcard segments (e.g. "slug", "path") */
+  name?: string;
+}
+
+/**
+ * An entry in the route manifest — the core data structure that replaces
+ * the old scan-and-register approach. Every page in the app directory
+ * produces one RouteManifestEntry.
+ *
+ * The manifest is the single source of truth for:
+ * - Route matching (regex pattern + params extraction)
+ * - Page rendering (filePath → import → Page component)
+ * - Hot reload (filePath → dependency graph)
+ * - Future: nested layouts, API routes, runtime route lifecycle
+ *
+ * Example for `app/blog/[slug]/page.tsx`:
+ *   {
+ *     kind: "page",
+ *     path: "/blog/[slug]",
+ *     pattern: /^\/blog\/([^/]+)$/,
+ *     segments: [
+ *       { raw: "blog", kind: "static" },
+ *       { raw: "[slug]", kind: "param", name: "slug" },
+ *     ],
+ *     params: ["slug"],
+ *     filePath: "/abs/path/to/app/blog/[slug]/page.tsx",
+ *   }
+ */
+interface RouteManifestEntry {
+  /** "page" for page routes (future: "api" for API routes) */
+  kind: "page";
+  /** The route pattern with bracket notation (e.g. "/blog/[slug]") */
+  path: string;
+  /** Compiled regex for matching URL paths and extracting params */
+  pattern: RegExp;
+  /** Parsed segments of the route path */
+  segments: RouteSegment[];
+  /** Ordered list of dynamic param names (e.g. ["slug"]) */
+  params: string[];
+  /** Absolute file path to the page module */
+  filePath: string;
+  /** Whether this route has any dynamic segments */
+  isDynamic: boolean;
+  /** Loaded page component (undefined until loaded) */
+  Page?: Component;
+}
+
 interface LayoutWrapperProps {
   Page: Component;
+  params: Record<string, string>;
 }
 
 interface IslandReference {
@@ -1071,15 +1140,240 @@ function resolveAppDir(root: string, config: MeidenConfig) {
   return resolve(root, config.appDir ?? config.srcDir ?? "src/app");
 }
 
-function toRoutePath(appDir: string, filePath: string) {
+/**
+ * Parse a single directory segment name into a RouteSegment.
+ *
+ * Handles three patterns:
+ *   "blog"         → { raw: "blog", kind: "static" }
+ *   "[slug]"       → { raw: "[slug]", kind: "param", name: "slug" }
+ *   "[...path]"    → { raw: "[...path]", kind: "wildcard", name: "path" }
+ *
+ * The bracket notation follows Next.js App Router conventions:
+ * - [param] matches a single path segment (no slashes)
+ * - [...param] matches one or more path segments (required catch-all)
+ *   Note: Next.js also has [[...param]] for optional catch-all, which
+ *   Meiden does not currently support.
+ */
+function parseSegment(raw: string): RouteSegment {
+  // Catch-all: [...param]
+  const wildcardMatch = raw.match(/^\[\.\.\.(\w+)\]$/);
+  if (wildcardMatch) {
+    return { raw, kind: "wildcard", name: wildcardMatch[1] };
+  }
+
+  // Dynamic param: [param]
+  const paramMatch = raw.match(/^\[(\w+)\]$/);
+  if (paramMatch) {
+    return { raw, kind: "param", name: paramMatch[1] };
+  }
+
+  // Static segment
+  return { raw, kind: "static" };
+}
+
+/**
+ * Build a route manifest entry from a page file path.
+ *
+ * This replaces the old `toRoutePath()` + separate `scanAppRoutes()` approach.
+ * Instead of just producing a flat string path, it:
+ *   1. Parses each directory segment into a RouteSegment
+ *   2. Compiles a regex pattern for URL matching
+ *   3. Extracts the ordered list of dynamic param names
+ *   4. Stores the original path with bracket notation
+ *
+ * The compiled regex enables O(n) route matching where n is the number of
+ * routes, with O(1) param extraction via capture groups. Static routes are
+ * tried first (no regex needed), then dynamic routes in order of specificity:
+ * more specific patterns (fewer wildcards, more static segments) are matched
+ * before less specific ones.
+ *
+ * Example inputs → outputs:
+ *   app/page.tsx              → path: "/", pattern: /^\/$/, params: []
+ *   app/about/page.tsx        → path: "/about", pattern: /^\/about$/, params: []
+ *   app/blog/[slug]/page.tsx  → path: "/blog/[slug]", pattern: /^\/blog\/([^/]+)$/, params: ["slug"]
+ *   app/docs/[...path]/page.tsx → path: "/docs/[...path]", pattern: /^\/docs\/([^/]+(?:\/[^/]+)*)$/, params: ["path"]
+ */
+function buildRouteManifestEntry(appDir: string, filePath: string): RouteManifestEntry {
   const relativePath = filePath.slice(appDir.length + 1);
   const routeDir = relativePath.replace(routeFilePattern, "");
 
+  // Root page: app/page.tsx → "/"
   if (!routeDir) {
-    return "/";
+    return {
+      kind: "page",
+      path: "/",
+      pattern: /^\/$/,
+      segments: [],
+      params: [],
+      filePath,
+      isDynamic: false,
+    };
   }
 
-  return `/${routeDir}`;
+  // Parse each directory segment
+  const dirParts = routeDir.split("/");
+  const segments = dirParts.map(parseSegment);
+
+  // Build the path string with bracket notation
+  const path = "/" + segments.map(s => s.raw).join("/");
+
+  // Extract param names in order
+  const params = segments.filter(s => s.kind !== "static").map(s => s.name!);
+
+  // Build the regex pattern for URL matching
+  let patternStr = "^";
+  for (const seg of segments) {
+    patternStr += "\\/";
+    if (seg.kind === "static") {
+      // Escape regex special characters in static segment names
+      patternStr += seg.raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    } else if (seg.kind === "param") {
+      // [param] matches exactly one non-slash segment
+      patternStr += "([^/]+)";
+    } else if (seg.kind === "wildcard") {
+      // [...param] matches one or more segments (including slashes).
+      // This follows Next.js App Router convention where `[...param]`
+      // requires at least one segment, while `[[...param]]` is the
+      // optional catch-all. Meiden does not currently support the
+      // optional `[[...param]]` syntax.
+      patternStr += "([^/]+(?:\\/[^/]+)*)";
+    }
+  }
+  patternStr += "$";
+  const pattern = new RegExp(patternStr);
+
+  const isDynamic = segments.some(s => s.kind !== "static");
+
+  return {
+    kind: "page",
+    path,
+    pattern,
+    segments,
+    params,
+    filePath,
+    isDynamic,
+  };
+}
+
+/**
+ * Safely decode a URL-encoded param value. Returns the decoded string
+ * on success, or null if the value contains malformed percent-encoding
+ * (e.g. `%E0%A4%A` — incomplete UTF-8 sequence). Returning null signals
+ * to matchRoute() that this URL should be treated as "no match" (→ 404),
+ * which is safer than:
+ *   - Letting decodeURIComponent throw (matchRoute is called before the
+ *     SSR try/catch, so the error would escape normal handling)
+ *   - Silently passing the raw encoded value through (page components
+ *     would receive garbled data like "hello%20world" instead of "hello world")
+ *   - Returning the raw value on failure (inconsistent — some params
+ *     decoded, others not)
+ */
+function safeDecodeParam(value: string): string | null {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Match a URL pathname against the route manifest and return the
+ * matching entry plus extracted params.
+ *
+ * Matching strategy:
+ *   1. Try static routes first (exact string match, O(1) via Map lookup)
+ *   2. Try dynamic routes in registration order
+ *      (more specific patterns are registered first by buildRouteManifest)
+ *
+ * Returns { entry, params } on match, or undefined if no route matches.
+ * The params object maps param names to their extracted values:
+ *   - [slug] → { slug: "hello" }
+ *   - [...path] → { path: "a/b/c" } (string with slashes, at least one segment required)
+ */
+function matchRoute(
+  pathname: string,
+  staticRoutes: Map<string, RouteManifestEntry>,
+  dynamicRoutes: RouteManifestEntry[],
+): { entry: RouteManifestEntry; params: Record<string, string> } | undefined {
+  // Fast path: exact match for static routes
+  const staticEntry = staticRoutes.get(pathname);
+  if (staticEntry) {
+    return { entry: staticEntry, params: {} };
+  }
+
+  // Try each dynamic route pattern
+  for (const entry of dynamicRoutes) {
+    const match = pathname.match(entry.pattern);
+    if (match) {
+      const params: Record<string, string> = {};
+      for (let i = 0; i < entry.params.length; i++) {
+        const paramName = entry.params[i];
+        const captured = match[i + 1];
+        // URL-decode the captured value so that page components
+        // receive decoded params. For example, /blog/hello%20world
+        // should produce { slug: "hello world" }, not "hello%20world".
+        // The ?? "" is a safety fallback for unexpected edge cases.
+        // Uses safeDecodeParam instead of raw decodeURIComponent so
+        // that malformed percent-encoded URLs (e.g. /blog/%E0%A4%A)
+        // don't throw an unhandled URIError. Since matchRoute() is
+        // called before the SSR try/catch block, a raw
+        // decodeURIComponent crash would escape the normal error
+        // handling path. On decode failure we treat the route as
+        // "no match" (return undefined) which results in a 404 —
+        // this is safer than passing the raw encoded value through
+        // or letting the error propagate.
+        const decoded = captured ? safeDecodeParam(captured) : "";
+        if (decoded === null) return undefined; // malformed encoding → no match
+        params[paramName] = decoded;
+      }
+      return { entry, params };
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Build the complete route manifest for the app directory.
+ *
+ * Scans all page.tsx files and returns a sorted array of RouteManifestEntry.
+ * Static routes come first, followed by dynamic routes sorted by specificity:
+ *   1. Routes with more static segments before routes with fewer
+ *   2. Routes with params before routes with wildcards
+ *   3. Alphabetical as tiebreaker
+ *
+ * This ordering ensures that more specific patterns are matched first
+ * when trying dynamic routes sequentially. For example:
+ *   /blog/archive  (static)  → matched before
+ *   /blog/[slug]   (param)   → matched before
+ *   /docs/[...path] (wildcard)
+ */
+function buildRouteManifest(appDir: string): RouteManifestEntry[] {
+  const routeFiles = scanAppRoutes(appDir);
+  const entries = routeFiles.map(filePath => buildRouteManifestEntry(appDir, filePath));
+
+  // Sort: static routes first, then by specificity (more static segments first),
+  // then params before wildcards, then alphabetically
+  entries.sort((a, b) => {
+    // Static routes before dynamic routes
+    if (!a.isDynamic && b.isDynamic) return -1;
+    if (a.isDynamic && !b.isDynamic) return 1;
+
+    // Both dynamic: count static segments (more specific first)
+    const aStaticCount = a.segments.filter(s => s.kind === "static").length;
+    const bStaticCount = b.segments.filter(s => s.kind === "static").length;
+    if (aStaticCount !== bStaticCount) return bStaticCount - aStaticCount;
+
+    // Params before wildcards
+    const aWildcard = a.segments.some(s => s.kind === "wildcard");
+    const bWildcard = b.segments.some(s => s.kind === "wildcard");
+    if (aWildcard !== bWildcard) return aWildcard ? 1 : -1;
+
+    // Alphabetical as tiebreaker
+    return a.path.localeCompare(b.path);
+  });
+
+  return entries;
 }
 
 function scanAppRoutes(appDir: string) {
@@ -1140,9 +1434,13 @@ async function loadAppModules(root: string, config: MeidenConfig): Promise<AppMo
   }
 
   const layoutModule = await import(pathToFileURL(createServerModule(root, resolveAppModule(appDir, "layout"))).href);
-  const routeFiles = scanAppRoutes(appDir);
 
-  if (!layoutModule.default || routeFiles.length === 0) {
+  // Build the route manifest instead of the old scan+toRoutePath approach.
+  // The manifest provides regex patterns, parsed segments, and param names
+  // for dynamic route support ([slug], [...path]).
+  const manifest = buildRouteManifest(appDir);
+
+  if (!layoutModule.default || manifest.length === 0) {
     throw new Error("Meiden app router projects must export src/app/layout and at least one page.");
   }
 
@@ -1150,38 +1448,33 @@ async function loadAppModules(root: string, config: MeidenConfig): Promise<AppMo
   // kill the entire server. Failed routes get an error-page component
   // that renders a 500 when visited.
   const routes = await Promise.all(
-    routeFiles.map(async (filePath) => {
-      const routePath = toRoutePath(appDir, filePath);
-
+    manifest.map(async (entry) => {
       try {
-        const pageModule = await import(pathToFileURL(createServerModule(root, filePath)).href);
+        const pageModule = await import(pathToFileURL(createServerModule(root, entry.filePath)).href);
 
         if (!pageModule.default) {
-          console.warn(`[meiden] Page has no default export: ${filePath}`);
+          console.warn(`[meiden] Page has no default export: ${entry.filePath}`);
           return {
-            path: routePath,
+            ...entry,
             Page: () => {
-              throw new Error(`Page missing default export: ${filePath}`);
+              throw new Error(`Page missing default export: ${entry.filePath}`);
             },
-            filePath,
           };
         }
 
         return {
-          path: routePath,
+          ...entry,
           Page: pageModule.default,
-          filePath,
         };
       } catch (error) {
         // Import-time failure (syntax error, missing dep, etc.)
         const message = error instanceof Error ? error.message : String(error);
-        console.error(`[meiden] Failed to load page module ${filePath}: ${message}`);
+        console.error(`[meiden] Failed to load page module ${entry.filePath}: ${message}`);
         return {
-          path: routePath,
+          ...entry,
           Page: () => {
             throw new Error(`Failed to load page: ${message}`);
           },
-          filePath,
         };
       }
     }),
@@ -1407,8 +1700,8 @@ async function buildIslandModule(root: string, source: string, exportName: strin
 // ─── Layout & Route Rendering ──────────────────────────────────────
 
 export function createLayoutWrapper(RootLayout: AppModules["RootLayout"]) {
-  return function LayoutWrapper({ Page }: LayoutWrapperProps): any {
-    return <RootLayout><Page /></RootLayout>;
+  return function LayoutWrapper({ Page, params }: LayoutWrapperProps): any {
+    return <RootLayout><Page params={params} /></RootLayout>;
   };
 }
 
@@ -1775,10 +2068,21 @@ let inFlightRequests = 0;
 /**
  * Mutable route store — route handlers read from this object so that
  * hot reload can update it without re-registering Elysia routes.
+ *
+ * The store holds both static and dynamic routes separately:
+ * - staticRoutes: Map<pathname, RouteManifestEntry> for O(1) exact match
+ * - dynamicRoutes: RouteManifestEntry[] for sequential pattern matching
+ * This split enables fast lookups for static routes (the common case)
+ * while still supporting dynamic routes ([slug], [...path]).
  */
 interface RouteStore {
   RootLayout: Component<{ children: unknown }>;
-  routes: Map<string, AppRoute>; // path → route (for O(1) lookup)
+  /** Static routes indexed by exact pathname for O(1) lookup */
+  staticRoutes: Map<string, RouteManifestEntry>;
+  /** Dynamic routes ordered by specificity (most specific first) */
+  dynamicRoutes: RouteManifestEntry[];
+  /** All routes indexed by filePath for hot reload lookups */
+  routesByFilePath: Map<string, RouteManifestEntry>;
 }
 
 /**
@@ -1786,6 +2090,9 @@ interface RouteStore {
  * re-imports it, and updates the route store. Errors are logged but
  * do not crash the server — the old route stays active until the
  * broken file is fixed.
+ *
+ * Uses the route manifest entry from routesByFilePath to find the
+ * existing entry, then updates it with the new Page component.
  */
 async function hotReloadPage(
   projectRoot: string,
@@ -1793,8 +2100,13 @@ async function hotReloadPage(
   routeStore: RouteStore,
   filePath: string,
 ) {
-  const appDir = resolveAppDir(projectRoot, config);
-  const routePath = toRoutePath(appDir, filePath);
+  const existingEntry = routeStore.routesByFilePath.get(filePath);
+  if (!existingEntry) {
+    // File not in manifest — this shouldn't happen for page files that
+    // were loaded at startup, but handle it gracefully.
+    console.warn(`[meiden] Hot reload: no manifest entry for ${filePath}`);
+    return;
+  }
 
   try {
     const serverModulePath = createServerModule(projectRoot, filePath);
@@ -1802,22 +2114,14 @@ async function hotReloadPage(
 
     if (!pageModule.default) {
       console.warn(`[meiden] Hot reload: page has no default export: ${filePath}`);
-      routeStore.routes.set(routePath, {
-        path: routePath,
-        Page: () => {
-          throw new Error(`Page missing default export: ${filePath}`);
-        },
-        filePath,
-      });
+      existingEntry.Page = () => {
+        throw new Error(`Page missing default export: ${filePath}`);
+      };
       return;
     }
 
-    routeStore.routes.set(routePath, {
-      path: routePath,
-      Page: pageModule.default,
-      filePath,
-    });
-    console.log(`[meiden] Hot reload: ${routePath}`);
+    existingEntry.Page = pageModule.default;
+    console.log(`[meiden] Hot reload: ${existingEntry.path}`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(`[meiden] Hot reload failed for ${filePath}: ${message}`);
@@ -1917,9 +2221,29 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
   // Mutable route store — hot reload updates this in-place.
   // Route handlers read from this store instead of closing over
   // fixed values, so they always serve the latest version.
+  //
+  // Routes are split into static (exact path, O(1) Map lookup) and
+  // dynamic (regex pattern matching) for efficient matching. The
+  // routesByFilePath index enables hot reload to find the right entry
+  // without scanning all routes.
+  const staticRoutes = new Map<string, RouteManifestEntry>();
+  const dynamicRoutes: RouteManifestEntry[] = [];
+  const routesByFilePath = new Map<string, RouteManifestEntry>();
+
+  for (const route of initialRoutes) {
+    routesByFilePath.set(route.filePath, route);
+    if (route.isDynamic) {
+      dynamicRoutes.push(route);
+    } else {
+      staticRoutes.set(route.path, route);
+    }
+  }
+
   const routeStore: RouteStore = {
     RootLayout,
-    routes: new Map(initialRoutes.map(r => [r.path, r])),
+    staticRoutes,
+    dynamicRoutes,
+    routesByFilePath,
   };
 
   const publicDir = join(projectRoot, "public");
@@ -1975,31 +2299,47 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
     return buildIslandModule(projectRoot, decodeURIComponent(params.source), String(query.name ?? "default"));
   });
 
-  // Register routes that read from the mutable routeStore.
-  // When hot reload updates routeStore, the next request will
-  // automatically use the new module without re-registering routes.
-  for (const route of initialRoutes) {
-    app.get(route.path, async ({ request, set }) => {
-      const startedAt = performance.now();
-      // Look up the latest version of this route from the store
-      const currentRoute = routeStore.routes.get(route.path) ?? route;
+  // Catch-all page route handler — matches both static and dynamic routes.
+  // Instead of registering each route individually with Elysia (which only
+  // supports exact path matching), we register a single catch-all handler
+  // that uses the route manifest for matching:
+  //   1. Try static routes first (O(1) Map lookup)
+  //   2. Try dynamic routes by regex pattern matching
+  //   3. Fall through to static file serving or 404
+  //
+  // This replaces the old approach of `for (route of initialRoutes) app.get(...)`
+  // which couldn't handle dynamic segments like [slug] or [...path].
+  app.get("/*", async ({ request }) => {
+    const startedAt = performance.now();
+    const url = new URL(request.url);
+    const pathname = url.pathname;
+
+    // Try to match a route from the manifest
+    const match = matchRoute(pathname, routeStore.staticRoutes, routeStore.dynamicRoutes);
+
+    if (match) {
+      const { entry, params } = match;
+      const routePath = entry.path;
 
       try {
         // Create a fresh LayoutWrapper each request using the current RootLayout
         // from the mutable store. This ensures hot-reloaded layouts take effect
         // immediately without restarting the server.
         const CurrentLayoutWrapper = createLayoutWrapper(routeStore.RootLayout);
-        const page = <CurrentLayoutWrapper Page={currentRoute.Page} />;
+
+        // Pass params as props to the Page component for dynamic routes.
+        // Static routes receive an empty params object.
+        const Page = entry.Page;
+        const page = <CurrentLayoutWrapper Page={Page} params={params} />;
         const html = await renderReact(projectRoot, page);
-        logRequest(request.method, route.path, 200, startedAt);
+        logRequest(request.method, routePath, 200, startedAt);
 
         return html;
       } catch (error) {
         // Return 500 with error details instead of 200 with raw JSX
-        logRequest(request.method, route.path, 500, startedAt);
-        console.error("[meiden] SSR error on " + route.path + ":", error);
+        logRequest(request.method, routePath, 500, startedAt);
+        console.error("[meiden] SSR error on " + routePath + ":", error);
 
-        set.status = 500;
         const message = error instanceof Error ? error.message : "Internal Server Error";
         // Escape error message for safe HTML embedding (even in dev)
         const safeMessage = message
@@ -2007,22 +2347,15 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
           .replaceAll("<", "&lt;")
           .replaceAll(">", "&gt;")
           .replaceAll('"', "&quot;");
-        return `<!DOCTYPE html><html><body><h1>500 - Server Error</h1><pre>${safeMessage}</pre></body></html>`;
+        return new Response(
+          `<!DOCTYPE html><html><body><h1>500 - Server Error</h1><pre>${safeMessage}</pre></body></html>`,
+          { status: 500 },
+        );
       }
-    });
-  }
+    }
 
-  // Catch-all route: serve static files from public/, or return 404.
-  // This MUST be registered after all page routes so that specific routes
-  // take priority. Elysia's onBeforeHandle only fires for matched routes,
-  // so a request like /index.css (which has no registered route) would
-  // previously skip the middleware and get a 404. The catch-all ensures
-  // every request matches at least one route, so the concurrency counter
-  // and static file serving both work correctly.
-  app.get("/*", ({ request }) => {
+    // No route matched — try static file serving from public/
     if (hasPublicDir) {
-      const url = new URL(request.url);
-      const pathname = url.pathname;
       const cleanPath = pathname.replace(/^\/+/, "");
       const candidateFile = resolve(publicDir, cleanPath);
 
