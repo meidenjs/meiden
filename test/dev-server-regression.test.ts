@@ -2156,3 +2156,256 @@ describe("runtime nested layout deletion regression", () => {
     }
   });
 });
+
+// ─── Test PR#13: Data Loading — load() export ──────────────────────
+
+describe("data loading (load export) regression", () => {
+  it("should call load() and pass data as prop to page component", async () => {
+    const projectRoot = join(tempRoot, "data-loading");
+    const appDir = join(projectRoot, "src", "app");
+
+    mkdirSync(appDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Page with load() export
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export async function load() {
+  return { title: "Hello from load", count: 42 };
+}
+
+export default function Page({ data }: { data: { title: string; count: number } }) {
+  return <div>DATA:{data.title}:{data.count}</div>;
+}`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      const res = await fetchUrl(`${baseUrl}/`);
+      expect(res.status).toBe(200);
+      expect(res.body).toContain("Hello from load");
+      expect(res.body).toContain("42");
+      expect(res.body).toContain("DATA:");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test PR#13: Data Loading — page without load() ────────────────
+
+describe("page without load export regression", () => {
+  it("should render page without data prop when no load() is exported", async () => {
+    const projectRoot = join(tempRoot, "no-load-export");
+    const appDir = join(projectRoot, "src", "app");
+
+    mkdirSync(appDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Page without load() export
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>No Load</h1>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      const res = await fetchUrl(`${baseUrl}/`);
+      expect(res.status).toBe(200);
+      expect(res.body).toContain("No Load");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test PR#13: Data Loading — load() with dynamic route params ───
+
+describe("data loading with dynamic route params regression", () => {
+  it("should pass route params to load() and render with fetched data", async () => {
+    const projectRoot = join(tempRoot, "data-loading-params");
+    const appDir = join(projectRoot, "src", "app");
+    const blogDir = join(appDir, "blog", "[slug]");
+
+    mkdirSync(blogDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Static home page
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+
+    // Dynamic blog page with load() that uses params
+    writeFileSync(
+      join(blogDir, "page.tsx"),
+      `export async function load({ params }: { params: { slug: string } }) {
+  return { postTitle: "Post: " + params.slug, views: 100 };
+}
+
+export default function BlogPost({ params, data }: { params: { slug: string }; data: { postTitle: string; views: number } }) {
+  return <article>TITLE:{data.postTitle}:VIEWS:{data.views}</article>;
+}`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      const res = await fetchUrl(`${baseUrl}/blog/my-post`);
+      expect(res.status).toBe(200);
+      expect(res.body).toContain("Post: my-post");
+      expect(res.body).toContain("100");
+      expect(res.body).toContain("TITLE:");
+      expect(res.body).toContain("VIEWS:");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test PR#13: Data Loading — load() error returns 500 ───────────
+
+describe("data loading error regression", () => {
+  it("should return 500 when load() throws an error", async () => {
+    const projectRoot = join(tempRoot, "data-loading-error");
+    const appDir = join(projectRoot, "src", "app");
+
+    mkdirSync(appDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Valid home page
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+
+    // Broken page with load() that throws
+    const brokenDir = join(appDir, "broken");
+    mkdirSync(brokenDir, { recursive: true });
+    writeFileSync(
+      join(brokenDir, "page.tsx"),
+      `export async function load() {
+  throw new Error("Database connection failed");
+}
+
+export default function Page({ data }: { data: any }) {
+  return <div>{data}</div>;
+}`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Home page should still work
+      const homeRes = await fetchUrl(`${baseUrl}/`);
+      expect(homeRes.status).toBe(200);
+      expect(homeRes.body).toContain("Home");
+
+      // Broken page should return 500 (load() threw)
+      const brokenRes = await fetchUrl(`${baseUrl}/broken`);
+      expect(brokenRes.status).toBe(500);
+      expect(brokenRes.body).toContain("Database connection failed");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test PR#13: Data Loading — load() hot reload ──────────────────
+
+describe("data loading hot reload regression", () => {
+  it("should serve updated data after load() is modified (no restart)", async () => {
+    const projectRoot = join(tempRoot, "data-loading-hmr");
+    const appDir = join(projectRoot, "src", "app");
+
+    mkdirSync(appDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Page with load() — initially returns version 1
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export async function load() {
+  return { version: "v1" };
+}
+
+export default function Page({ data }: { data: { version: string } }) {
+  return <span>Version:{data.version}</span>;
+}`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Step 1: Request / and see v1
+      const resA = await fetchUrl(`${baseUrl}/`);
+      expect(resA.status).toBe(200);
+      expect(resA.body).toContain("Version:");
+      expect(resA.body).toContain("v1");
+
+      // Step 2: Edit page.tsx to return v2
+      writeFileSync(
+        join(appDir, "page.tsx"),
+        `export async function load() {
+  return { version: "v2" };
+}
+
+export default function Page({ data }: { data: { version: string } }) {
+  return <span>Version:{data.version}</span>;
+}`,
+      );
+
+      // Step 3: Wait for the file watcher to detect the change
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      // Step 4: Request / again — should see v2
+      const resB = await fetchUrl(`${baseUrl}/`);
+      expect(resB.status).toBe(200);
+      expect(resB.body).toContain("v2");
+      expect(resB.body).not.toContain("v1");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
