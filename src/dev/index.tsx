@@ -1876,6 +1876,16 @@ async function hotReloadComponent(
 
 export async function startServer({ root, port = 3000 }: StartServerOptions) {
   const projectRoot = resolve(root);
+
+  // Clean up stale generated server modules from previous dev sessions.
+  // With generation-scoped cyclic paths, files accumulate rapidly across
+  // HMR cascades — clearing on startup prevents .meiden/server from
+  // growing unboundedly across repeated dev runs.
+  const serverTmpDir = join(projectRoot, ".meiden", "server");
+  if (existsSync(serverTmpDir)) {
+    rmSync(serverTmpDir, { recursive: true, force: true });
+  }
+
   const config = await loadConfig(projectRoot);
   const { RootLayout, routes: initialRoutes } = await loadAppModules(projectRoot, config);
 
