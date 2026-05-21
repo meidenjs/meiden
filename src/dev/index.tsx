@@ -11,6 +11,7 @@ import {
   readdirSync,
   rmSync,
   statSync,
+  watch,
   writeFileSync,
 } from "node:fs";
 import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
@@ -736,81 +737,294 @@ ${exports.join("\n")}
  * - Multi-line imports
  * - Import comments
  */
-function createServerModule(root: string, filePath: string) {
+/**
+ * Dependency graph: maps a server module's source file path to the set of
+ * source file paths that import it (directly or indirectly). Used by the
+ * hot-reload watcher to find which page/layout modules need to be
+ * re-imported when a component file changes.
+ */
+const dependencyGraph = new Map<string, Set<string>>();
+
+/** Register that `importerPath` imports `dependencyPath`. */
+function registerDependency(importerPath: string, dependencyPath: string) {
+  if (!dependencyGraph.has(dependencyPath)) {
+    dependencyGraph.set(dependencyPath, new Set());
+  }
+  dependencyGraph.get(dependencyPath)!.add(importerPath);
+}
+
+/**
+ * Clear all dependency edges where `importerPath` is the importer.
+ * Called before re-transforming a file during hot reload so that
+ * stale edges (from imports that were removed) don't linger.
+ */
+function clearDependenciesOf(importerPath: string) {
+  for (const dependents of dependencyGraph.values()) {
+    dependents.delete(importerPath);
+  }
+}
+
+/**
+ * Find all source files that transitively depend on `sourcePath`.
+ * Walks the dependency graph upward to find the root importers
+ * (page/layout files). Returns a set of absolute file paths.
+ */
+function findDependents(sourcePath: string): Set<string> {
+  const visited = new Set<string>();
+  const result = new Set<string>();
+
+  function walk(path: string) {
+    if (visited.has(path)) return;
+    visited.add(path);
+
+    const dependents = dependencyGraph.get(path);
+    if (dependents) {
+      for (const dep of dependents) {
+        result.add(dep);
+        walk(dep);
+      }
+    }
+  }
+
+  walk(sourcePath);
+  return result;
+}
+
+/**
+ * Monotonically increasing counter incremented each time a top-level
+ * `createServerModule` call begins. Used as a transform generation ID
+ * in the deterministic cyclic path so that every HMR cascade produces
+ * fresh paths for ALL files — even those whose own source didn't change.
+ *
+ * Why not just hash the source? Consider A → B → A (cycle):
+ *   - Edit B only: A's source is unchanged → sourceHash is the same
+ *   - But A's transformed output DID change (A imports B's new path)
+ *   - Bun's ESM cache would return the old deterministic A module
+ *   - With a generation ID, A's path changes on every HMR cascade
+ *
+ * The generation is scoped to a single transform cascade: all recursive
+ * calls within the same top-level call share the same generation ID.
+ */
+let transformGeneration = 0;
+
+/**
+ * Create a server-side version of a module by rewriting imports.
+ *
+ * For page/layout files: rewrites client component imports to island proxies,
+ * unresolvable imports to throwing Proxy stubs, and recursively transforms
+ * non-client relative imports through `createServerModule` so that the
+ * entire import chain is content-hashed. This creates a cascade: when a
+ * component changes, its server module gets a new hash → the importing
+ * page's specifier changes → the page's server module gets a new hash →
+ * Bun's dynamic `import()` loads the fresh code instead of the cached version.
+ *
+ * For component/utility files: same logic applies — all relative imports
+ * are recursively transformed, so deep dependency chains are fully tracked.
+ *
+ * Circular import guard: the `stack` set tracks files currently being
+ * processed on the call stack. A path is added on entry and removed in a
+ * `finally` block on exit, so only files that are ancestors in the current
+ * recursion chain remain in the set. If a circular import is detected
+ * (A → B → A), the function returns the in-progress server module path
+ * instead of recursing, breaking the cycle safely. Shared dependencies
+ * are not affected because they are removed from the stack once finished:
+ *
+ *     page → A → Shared   (Shared removed after A finishes)
+ *     page → B → Shared   (Shared not in stack — processed normally)
+ *
+ * In-progress module map: the `inProgress` map tracks the generation-scoped
+ * server module path for each file currently being transformed. When a
+ * circular import is detected, the cyclic reference uses this path
+ * instead of the raw source path. This ensures that even cyclic
+ * references point to a Meiden-transformed module (with `import React`,
+ * rewritten island proxies, etc.) rather than the unprocessed source.
+ *
+ * Generation-scoped versioning: the in-progress path includes a
+ * transform generation ID (`route-${hash(realPath)}-${transformId}.tsx`).
+ * This ensures the path changes for every HMR transform cascade, even
+ * if a particular file's own source didn't change. Without this, a
+ * file whose source was unchanged but whose transformed output changed
+ * (due to a dependency being edited) would keep the same deterministic
+ * path and Bun would return the cached (stale) module:
+ *
+ *     A → B → A (cycle)
+ *     Edit B only: A's source unchanged, but A's transform DID change
+ *     → transformGeneration increments → new deterministic path for A
+ *     → Bun loads fresh module instead of cached one
+ *
+ * The transformed content is written to both:
+ *   1. The generation-scoped path (for cyclic references — busts ESM cache)
+ *   2. The content-hashed path (for HMR cache-busting on the outer module)
+ * The content-hashed path is returned from the outermost call so the
+ * HMR cascade continues to work correctly.
+ */
+function createServerModule(root: string, filePath: string, stack?: Set<string>, inProgress?: Map<string, string>, transformId?: number) {
   const tmpDir = join(root, ".meiden", "server");
   mkdirSync(tmpDir, { recursive: true });
 
   const realPath = toPath(filePath);
+
+  // Circular import guard: if this file is already being processed
+  // higher up the call stack, return its in-progress server module path.
+  // This prevents infinite recursion when A imports B and B imports A.
+  // Unlike returning the raw source path, the in-progress path points
+  // to a Meiden-transformed module (with `import React`, rewritten
+  // island proxies, etc.) that will be written once the outer transform
+  // completes.
+  //
+  // The stack behaves like a recursion stack, not a global visited set:
+  // paths are added on entry and removed in a `finally` block on exit.
+  // This avoids false positives for shared dependencies (A → Shared,
+  // B → Shared) where Shared would otherwise remain in the set after
+  // A finishes and be incorrectly treated as circular when B imports it.
+  if (!stack) {
+    stack = new Set();
+    // Top-level call: increment the transform generation so that all
+    // deterministic cyclic paths in this cascade are fresh, even for
+    // files whose own source didn't change.
+    transformGeneration++;
+  }
+  if (!inProgress) inProgress = new Map();
+  // Use the transform generation ID from the top-level call (or
+  // fall back to the current counter value for safety).
+  const generation = transformId ?? transformGeneration;
+  if (stack.has(realPath)) {
+    // Cycle detected — return the in-progress server module path
+    // (or fall back to the raw source if not yet registered)
+    return inProgress.get(realPath) ?? realPath;
+  }
+  stack.add(realPath);
+
   const source = readFileSync(realPath, "utf8");
-  const imports = parseImports(realPath);
 
-  // Build replacements from end to start so offsets stay valid
-  const replacements: Array<{ start: number; end: number; text: string }> = [];
+  // Pre-compute a generation-scoped deterministic server module path
+  // and register it in the in-progress map before recursing into imports.
+  // This allows cyclic references to find a valid server module path
+  // even though the content-hashed path isn't known yet.
+  //
+  // The path includes the transform generation ID so that every HMR
+  // cascade produces fresh paths for ALL files, even those whose own
+  // source didn't change but whose transformed output did (because a
+  // dependency was edited). This prevents stale cyclic references:
+  //
+  //   A -> B -> A (cycle)
+  //   Edit B only: A's source unchanged, but transformGeneration
+  //   increments → A gets a new deterministic path → Bun loads
+  //   fresh module instead of the cached one
+  const deterministicPath = join(tmpDir, `route-${hash(realPath)}-${generation}.tsx`);
+  inProgress.set(realPath, deterministicPath);
 
-  for (const imp of imports) {
-    const resolvedImport = resolveImport(realPath, imp.specifier);
+  try {
+    const imports = parseImports(realPath);
 
-    if (!resolvedImport) {
-      // For relative imports that can't be resolved, generate lazy stub
-      // bindings using Proxy that throw only when accessed (not at module
-      // evaluation time). This prevents `await import(...)` from crashing
-      // the dev server and gives a clear error message when the unresolved
-      // binding is actually used at runtime.
-      // Non-relative imports (node_modules, built-ins) are left as-is.
-      if (imp.specifier.startsWith(".")) {
-        // Side-effect imports (no bindings): just remove the statement
-        if (imp.localBindings.length === 0) {
-          replacements.push({ start: imp.start, end: imp.end, text: "" });
-          continue;
-        }
+    // Clear stale dependency edges for this file before re-registering.
+    // This handles the case where a hot-reloaded file removed an import
+    // — without clearing, the old edge would remain in the graph.
+    clearDependenciesOf(realPath);
 
-        const safeSpecifier = escapeJsString(imp.specifier);
-        const safeFrom = escapeJsString(relative(root, realPath).replaceAll("\\", "/"));
-        const errMsg = `[meiden] Cannot resolve import ${safeSpecifier} from ${safeFrom}`;
+    // Build replacements from end to start so offsets stay valid
+    const replacements: Array<{ start: number; end: number; text: string }> = [];
 
-        // Generate a unique stub proxy variable for each binding.
-        // Use imp.start (byte offset of the import in the source) to avoid
-        // collisions when multiple broken imports exist in the same file.
-        const stubDecl = imp.localBindings.map((binding, i) => {
-          const stubVar = `__meiden_stub_${imp.start}_${i}`;
-          const localName = binding.localName;
+    for (const imp of imports) {
+      const resolvedImport = resolveImport(realPath, imp.specifier);
 
-          if (binding.kind === "namespace") {
-            // Namespace: Proxy on a plain object (no apply trap needed)
-            return `const ${stubVar} = new Proxy({}, { get: () => { throw new Error("${errMsg}"); } });\nconst ${localName} = ${stubVar};`;
+      if (!resolvedImport) {
+        // For relative imports that can't be resolved, generate lazy stub
+        // bindings using Proxy that throw only when accessed (not at module
+        // evaluation time). This prevents `await import(...)` from crashing
+        // the dev server and gives a clear error message when the unresolved
+        // binding is actually used at runtime.
+        // Non-relative imports (node_modules, built-ins) are left as-is.
+        if (imp.specifier.startsWith(".")) {
+          // Side-effect imports (no bindings): just remove the statement
+          if (imp.localBindings.length === 0) {
+            replacements.push({ start: imp.start, end: imp.end, text: "" });
+            continue;
           }
 
-          // Default and named: Proxy on a function (so it can be called)
-          return `const ${stubVar} = new Proxy(function() {}, { get: () => { throw new Error("${errMsg}"); }, apply: () => { throw new Error("${errMsg}"); } });\nconst ${localName} = ${stubVar};`;
-        }).join("\n");
+          const safeSpecifier = escapeJsString(imp.specifier);
+          const safeFrom = escapeJsString(relative(root, realPath).replaceAll("\\", "/"));
+          const errMsg = `[meiden] Cannot resolve import ${safeSpecifier} from ${safeFrom}`;
 
-        replacements.push({ start: imp.start, end: imp.end, text: stubDecl });
+          // Generate a unique stub proxy variable for each binding.
+          // Use imp.start (byte offset of the import in the source) to avoid
+          // collisions when multiple broken imports exist in the same file.
+          const stubDecl = imp.localBindings.map((binding, i) => {
+            const stubVar = `__meiden_stub_${imp.start}_${i}`;
+            const localName = binding.localName;
+
+            // All stubs use a plain object target with toString/valueOf/
+            // Symbol.toPrimitive methods that throw. This ensures that:
+            //
+            //   <div>{Missing}</div>  → React calls Missing.toString() → throw → 500
+            //   <Missing />           → React sees typeof !== "function" → "Element type is invalid" → throw → 500
+            //   Missing.someProp      → Proxy get trap → throw → 500
+            //   Missing()             → TypeError: Missing is not a function → 500
+            //
+            // We deliberately do NOT use a function target because React SSR
+            // skips functions rendered as JSX children (just warns, returns 200).
+            // Using an object target forces React into the toString() path which
+            // our throwing methods intercept.
+            const throwTarget = `{\n  toString() { throw new Error("${errMsg}"); },\n  valueOf() { throw new Error("${errMsg}"); },\n  [Symbol.toPrimitive]() { throw new Error("${errMsg}"); },\n}`;
+
+            return `const ${stubVar} = new Proxy(${throwTarget}, { get: () => { throw new Error("${errMsg}"); } });\nconst ${localName} = ${stubVar};`;
+          }).join("\n");
+
+          replacements.push({ start: imp.start, end: imp.end, text: stubDecl });
+        }
+        continue;
       }
-      continue;
+
+      if (isClientModule(resolvedImport)) {
+        const proxyPath = createIslandProxy(root, resolvedImport, imp.importedNames);
+        // Replace just the specifier part of the import
+        const newStatement = imp.statement.replace(imp.specifier, proxyPath);
+        replacements.push({ start: imp.start, end: imp.end, text: newStatement });
+      } else if (imp.specifier.startsWith(".")) {
+        // Recursively transform relative non-client imports so that the
+        // entire import chain is content-hashed. When a component changes,
+        // its server module gets a new hash → the importing file's specifier
+        // changes → its server module also gets a new hash → Bun's import()
+        // loads fresh code instead of the cached version.
+        //
+        // Also register the dependency relationship so that the hot-reload
+        // watcher can find which pages need re-importing when this component
+        // changes.
+        registerDependency(realPath, resolvedImport);
+        const depServerPath = createServerModule(root, resolvedImport, stack, inProgress, generation);
+        const newStatement = imp.statement.replace(imp.specifier, depServerPath);
+        replacements.push({ start: imp.start, end: imp.end, text: newStatement });
+      } else {
+        // Non-relative imports (node_modules, built-ins): leave as-is
+      }
     }
 
-    if (isClientModule(resolvedImport)) {
-      const proxyPath = createIslandProxy(root, resolvedImport, imp.importedNames);
-      // Replace just the specifier part of the import
-      const newStatement = imp.statement.replace(imp.specifier, proxyPath);
-      replacements.push({ start: imp.start, end: imp.end, text: newStatement });
-    } else {
-      // Rewrite relative imports to absolute paths for server-side resolution
-      const newStatement = imp.statement.replace(imp.specifier, resolvedImport);
-      replacements.push({ start: imp.start, end: imp.end, text: newStatement });
+    // Apply replacements from end to start to preserve offsets
+    let result = source;
+    for (const rep of replacements.sort((a, b) => b.start - a.start)) {
+      result = result.slice(0, rep.start) + rep.text + result.slice(rep.end);
     }
-  }
 
-  // Apply replacements from end to start to preserve offsets
-  let result = source;
-  for (const rep of replacements.sort((a, b) => b.start - a.start)) {
-    result = result.slice(0, rep.start) + rep.text + result.slice(rep.end);
-  }
+    result = `import React from "react";\n${result}`;
 
-  result = `import React from "react";\n${result}`;
-  const serverPath = join(tmpDir, `route-${hash(`${filePath}:${result}`)}.tsx`);
-  writeFileIfChanged(serverPath, result);
-  return serverPath;
+    // Write the transformed content to the generation-scoped path.
+    // This path is used by cyclic references (B → A when A → B → A),
+    // so it must contain the fully transformed module — not the raw
+    // source. Because the path includes the transform generation ID,
+    // it changes on every HMR cascade, busting Bun's ESM module cache
+    // for cyclic imports even when the file's own source didn't change.
+    writeFileIfChanged(deterministicPath, result);
+
+    // Also write to a content-hashed path for HMR cache-busting.
+    // When a file changes, its content hash changes → new filename →
+    // Bun's import() loads fresh code instead of the cached version.
+    const serverPath = join(tmpDir, `route-${hash(`${filePath}:${result}`)}.tsx`);
+    writeFileIfChanged(serverPath, result);
+    return serverPath;
+  } finally {
+    stack.delete(realPath);
+    inProgress.delete(realPath);
+  }
 }
 
 // ─── Config Loading ────────────────────────────────────────────────
@@ -1533,14 +1747,160 @@ export function startProductionServer({ root, outDir = "dist", port = 3000 }: Pr
 const MAX_CONCURRENT_REQUESTS = 100;
 let inFlightRequests = 0;
 
+/**
+ * Mutable route store — route handlers read from this object so that
+ * hot reload can update it without re-registering Elysia routes.
+ */
+interface RouteStore {
+  RootLayout: Component<{ children: unknown }>;
+  routes: Map<string, AppRoute>; // path → route (for O(1) lookup)
+}
+
+/**
+ * Hot-reload a single page module. Regenerates the server module,
+ * re-imports it, and updates the route store. Errors are logged but
+ * do not crash the server — the old route stays active until the
+ * broken file is fixed.
+ */
+async function hotReloadPage(
+  projectRoot: string,
+  config: MeidenConfig,
+  routeStore: RouteStore,
+  filePath: string,
+) {
+  const appDir = resolveAppDir(projectRoot, config);
+  const routePath = toRoutePath(appDir, filePath);
+
+  try {
+    const serverModulePath = createServerModule(projectRoot, filePath);
+    const pageModule = await import(pathToFileURL(serverModulePath).href);
+
+    if (!pageModule.default) {
+      console.warn(`[meiden] Hot reload: page has no default export: ${filePath}`);
+      routeStore.routes.set(routePath, {
+        path: routePath,
+        Page: () => {
+          throw new Error(`Page missing default export: ${filePath}`);
+        },
+        filePath,
+      });
+      return;
+    }
+
+    routeStore.routes.set(routePath, {
+      path: routePath,
+      Page: pageModule.default,
+      filePath,
+    });
+    console.log(`[meiden] Hot reload: ${routePath}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[meiden] Hot reload failed for ${filePath}: ${message}`);
+    // Keep the old route active — don't break the server
+  }
+}
+
+/**
+ * Hot-reload the layout module. Regenerates the server module,
+ * re-imports it, and updates the route store's RootLayout.
+ */
+async function hotReloadLayout(
+  projectRoot: string,
+  config: MeidenConfig,
+  routeStore: RouteStore,
+) {
+  const appDir = resolveAppDir(projectRoot, config);
+
+  try {
+    const layoutModule = await import(
+      pathToFileURL(createServerModule(projectRoot, resolveAppModule(appDir, "layout"))).href
+    );
+
+    if (!layoutModule.default) {
+      console.error("[meiden] Hot reload: layout has no default export — keeping old layout");
+      return;
+    }
+
+    routeStore.RootLayout = layoutModule.default;
+    console.log("[meiden] Hot reload: layout");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[meiden] Hot reload failed for layout: ${message}`);
+  }
+}
+
+/**
+ * Hot-reload a component (or any non-page/layout) file. Uses the
+ * dependency graph to find all pages and layouts that import this
+ * file (directly or transitively), then re-imports each one.
+ *
+ * Because createServerModule recursively transforms the entire import
+ * chain with content-hashed filenames, changing a component produces
+ * a new component server module with a new hash → the page's import
+ * specifier changes → the page's server module gets a new hash →
+ * Bun's import() loads fresh code instead of the cached version.
+ *
+ * If no dependents are found (e.g. a new file that hasn't been
+ * imported yet), this is a no-op.
+ */
+async function hotReloadComponent(
+  projectRoot: string,
+  config: MeidenConfig,
+  routeStore: RouteStore,
+  filePath: string,
+) {
+  // findDependents walks transitively, so we get all direct and
+  // indirect dependents (including pages/layouts that import the
+  // component through intermediate files).
+  const dependents = findDependents(filePath);
+  if (dependents.size === 0) {
+    console.log(`[meiden] Hot reload: ${filePath} changed but no dependents found`);
+    return;
+  }
+
+  const layoutPattern = /(^|\/)layout\.(tsx|ts|jsx|js)$/;
+
+  for (const depPath of dependents) {
+    if (!existsSync(depPath)) continue;
+
+    if (layoutPattern.test(depPath)) {
+      await hotReloadLayout(projectRoot, config, routeStore);
+    } else if (routeFilePattern.test(depPath)) {
+      await hotReloadPage(projectRoot, config, routeStore, depPath);
+    }
+    // Intermediate (non-page, non-layout) dependents don't need
+    // explicit handling — they are automatically re-transformed when
+    // createServerModule runs recursively for the page/layout.
+  }
+}
+
 export async function startServer({ root, port = 3000 }: StartServerOptions) {
   const projectRoot = resolve(root);
+
+  // Clean up stale generated server modules from previous dev sessions.
+  // With generation-scoped cyclic paths, files accumulate rapidly across
+  // HMR cascades — clearing on startup prevents .meiden/server from
+  // growing unboundedly across repeated dev runs.
+  const serverTmpDir = join(projectRoot, ".meiden", "server");
+  if (existsSync(serverTmpDir)) {
+    rmSync(serverTmpDir, { recursive: true, force: true });
+  }
+
   const config = await loadConfig(projectRoot);
-  const { RootLayout, routes } = await loadAppModules(projectRoot, config);
-  const LayoutWrapper = createLayoutWrapper(RootLayout);
+  const { RootLayout, routes: initialRoutes } = await loadAppModules(projectRoot, config);
+
+  // Mutable route store — hot reload updates this in-place.
+  // Route handlers read from this store instead of closing over
+  // fixed values, so they always serve the latest version.
+  const routeStore: RouteStore = {
+    RootLayout,
+    routes: new Map(initialRoutes.map(r => [r.path, r])),
+  };
 
   const publicDir = join(projectRoot, "public");
   const hasPublicDir = existsSync(publicDir);
+
+  const appDir = resolveAppDir(projectRoot, config);
 
   const app = new Elysia().use(html());
 
@@ -1590,12 +1950,21 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
     return buildIslandModule(projectRoot, decodeURIComponent(params.source), String(query.name ?? "default"));
   });
 
-  for (const route of routes) {
+  // Register routes that read from the mutable routeStore.
+  // When hot reload updates routeStore, the next request will
+  // automatically use the new module without re-registering routes.
+  for (const route of initialRoutes) {
     app.get(route.path, async ({ request, set }) => {
       const startedAt = performance.now();
+      // Look up the latest version of this route from the store
+      const currentRoute = routeStore.routes.get(route.path) ?? route;
 
       try {
-        const page = <LayoutWrapper Page={route.Page} />;
+        // Create a fresh LayoutWrapper each request using the current RootLayout
+        // from the mutable store. This ensures hot-reloaded layouts take effect
+        // immediately without restarting the server.
+        const CurrentLayoutWrapper = createLayoutWrapper(routeStore.RootLayout);
+        const page = <CurrentLayoutWrapper Page={currentRoute.Page} />;
         const html = await renderReact(projectRoot, page);
         logRequest(request.method, route.path, 200, startedAt);
 
@@ -1647,6 +2016,88 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
   });
 
   app.listen(port);
+
+  // ─── Hot Reload: file watcher ──────────────────────────────────────
+  //
+  // Watch the app directory for changes. When a page, layout, or
+  // component file changes, regenerate the server module, re-import
+  // it, and update the mutable routeStore. The next request will use
+  // the new code.
+  //
+  // Component hot reload: when a non-page/layout file (e.g. a
+  // component) changes, we use the dependency graph to find all
+  // pages/layouts that import it (directly or transitively), then
+  // re-import those modules. Because createServerModule recursively
+  // transforms the entire import chain with content-hashed filenames,
+  // changing a component → new component server module hash → new
+  // import specifier in the page → new page server module hash →
+  // Bun's import() loads fresh code.
+  //
+  // Debouncing: file editors often trigger multiple change events
+  // (write + rename, or multiple writes). We debounce by 100ms to
+  // avoid redundant reloads.
+  //
+  // Limitations:
+  //   - Adding a new route while the server is running does NOT
+  //     register it (routes are only scanned at startup).
+  //   - Deleting a route file keeps the old route active.
+  //   - Only editing existing routes/components triggers hot reload.
+  if (existsSync(appDir)) {
+    let reloadTimer: ReturnType<typeof setTimeout> | null = null;
+    const changedFiles = new Set<string>();
+
+    const layoutPattern = /(^|\/)layout\.(tsx|ts|jsx|js)$/;
+
+    const watcher = watch(appDir, { recursive: true }, (event, filename) => {
+      if (!filename) return;
+
+      const filePath = join(appDir, filename);
+
+      // Only react to source files
+      if (!moduleExtensions.some(ext => filePath.endsWith(ext))) return;
+
+      // All source files in appDir are watched — pages, layouts,
+      // components, utilities. Component changes are resolved via
+      // the dependency graph.
+      changedFiles.add(filePath);
+
+      // Debounce: collect all changed files within 100ms and reload once
+      if (reloadTimer) clearTimeout(reloadTimer);
+      reloadTimer = setTimeout(async () => {
+        reloadTimer = null;
+        const files = [...changedFiles];
+        changedFiles.clear();
+
+        for (const file of files) {
+          if (!existsSync(file)) {
+            // File was deleted — skip (route stays with old module)
+            console.log(`[meiden] Hot reload: file deleted ${file}, keeping old module`);
+            continue;
+          }
+
+          const isLayoutFile = layoutPattern.test(file);
+          const isPageFile = routeFilePattern.test(file);
+
+          if (isLayoutFile) {
+            await hotReloadLayout(projectRoot, config, routeStore);
+          } else if (isPageFile) {
+            await hotReloadPage(projectRoot, config, routeStore, file);
+          } else {
+            // Component/utility file changed — find all pages/layouts
+            // that depend on it and re-import them.
+            await hotReloadComponent(projectRoot, config, routeStore, file);
+          }
+        }
+      }, 100);
+    });
+
+    // Clean up watcher when the server stops
+    const originalStop = app.stop?.bind(app);
+    app.stop = () => {
+      watcher.close();
+      originalStop?.();
+    };
+  }
 
   return app;
 }

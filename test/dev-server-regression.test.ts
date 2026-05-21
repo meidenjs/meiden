@@ -35,7 +35,9 @@ afterAll(() => {
 
 /** Symlink node_modules from the main project so React is available */
 function symlinkNodeModules(projectRoot: string) {
-  const nmSource = join(process.cwd(), "node_modules");
+  // Use import.meta.dir to find node_modules relative to this test file,
+  // not process.cwd() which may differ depending on how bun test is invoked.
+  const nmSource = join(import.meta.dir, "..", "node_modules");
   const nmTarget = join(projectRoot, "node_modules");
   if (existsSync(nmSource) && !existsSync(nmTarget)) {
     try {
@@ -68,7 +70,8 @@ function writePackageJson(projectRoot: string) {
 async function startDevServer(
   projectRoot: string,
 ): Promise<{ baseUrl: string; app: any }> {
-  const { startServer } = await import("../src/dev/index.tsx");
+  const devModulePath = join(import.meta.dir, "..", "src", "dev", "index.tsx");
+  const { startServer } = await import(devModulePath);
   const app = await startServer({ root: projectRoot, port: 0 });
 
   // Elysia stores the Bun server on app.server
@@ -206,7 +209,8 @@ describe("missing config/app-dir diagnostics regression", () => {
 
     let thrownError: Error | null = null;
     try {
-      const { startServer } = await import("../src/dev/index.tsx");
+      const devModulePath = join(import.meta.dir, "..", "src", "dev", "index.tsx");
+      const { startServer } = await import(devModulePath);
       await startServer({ root: projectRoot, port: 0 });
     } catch (error) {
       thrownError = error instanceof Error ? error : new Error(String(error));
@@ -231,5 +235,416 @@ describe("missing config/app-dir diagnostics regression", () => {
 
     // Should suggest creating app directory or configuring meiden.config.ts
     expect(message).toContain("meiden.config");
+  });
+});
+
+// ─── Test 4: Broken Import JSX Child Returns 500 ──────────────────
+
+describe("broken import JSX child regression", () => {
+  it("should return 500 when broken import is rendered as JSX child", async () => {
+    const projectRoot = join(tempRoot, "broken-import-jsx-child");
+    const appDir = join(projectRoot, "src", "app");
+    const brokenDir = join(appDir, "broken");
+
+    mkdirSync(brokenDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Valid page at /
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+
+    // Page with broken import used as JSX child at /broken
+    writeFileSync(
+      join(brokenDir, "page.tsx"),
+      `import Missing from "./NonExistent";
+
+export default function Page() {
+  return <div>{Missing}</div>;
+}`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Valid route should return 200
+      const homeRes = await fetchUrl(`${baseUrl}/`);
+      expect(homeRes.status).toBe(200);
+      expect(homeRes.body).toContain("Home");
+
+      // Broken import as JSX child should trigger 500
+      // (toString/valueOf/Symbol.toPrimitive traps on the Proxy stub throw)
+      const brokenRes = await fetchUrl(`${baseUrl}/broken`);
+      expect(brokenRes.status).toBe(500);
+      expect(brokenRes.body).toContain("Cannot resolve import");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test 5: Hot Reload ──────────────────────────────────────────
+
+describe("hot reload regression", () => {
+  it("should serve updated content after page file is modified (no restart)", async () => {
+    const projectRoot = join(tempRoot, "hot-reload");
+    const appDir = join(projectRoot, "src", "app");
+
+    mkdirSync(appDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Initial page content
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Content A</h1>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Step 1: Request / and get Content A
+      const resA = await fetchUrl(`${baseUrl}/`);
+      expect(resA.status).toBe(200);
+      expect(resA.body).toContain("Content A");
+
+      // Step 2: Edit page.tsx to Content B
+      writeFileSync(
+        join(appDir, "page.tsx"),
+        `export default function Page() { return <h1>Content B</h1>; }`,
+      );
+
+      // Step 3: Wait for the file watcher to detect the change
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      // Step 4: Request / again — should get Content B
+      const resB = await fetchUrl(`${baseUrl}/`);
+      expect(resB.status).toBe(200);
+      expect(resB.body).toContain("Content B");
+      expect(resB.body).not.toContain("Content A");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test 7: Circular Import ─────────────────────────────────────
+
+describe("circular import guard regression", () => {
+  it("should start server without stack overflow when components have circular imports", async () => {
+    const projectRoot = join(tempRoot, "circular-import");
+    const appDir = join(projectRoot, "src", "app");
+    const componentsDir = join(appDir, "components");
+
+    mkdirSync(componentsDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Component A imports B
+    writeFileSync(
+      join(componentsDir, "A.tsx"),
+      `import B from "./B";\nexport default function A() { return <span>A</span>; }\nexport { B };`,
+    );
+
+    // Component B imports A (circular!)
+    writeFileSync(
+      join(componentsDir, "B.tsx"),
+      `import A from "./A";\nexport default function B() { return <span>B</span>; }\nexport { A };`,
+    );
+
+    // Page imports A
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `import A from "./components/A";\n\nexport default function Page() { return <div><A /></div>; }`,
+    );
+
+    // The server should start without infinite recursion
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Page should render successfully (component A works)
+      const res = await fetchUrl(`${baseUrl}/`);
+      expect(res.status).toBe(200);
+      expect(res.body).toContain("A");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test 9: Circular Import with Island Proxy ────────────────────
+
+describe("circular import with island proxy regression", () => {
+  it("should return a Meiden-transformed module path (not raw source) for circular imports, so island proxies are applied correctly", async () => {
+    const projectRoot = join(tempRoot, "circular-import-island");
+    const appDir = join(projectRoot, "src", "app");
+    const componentsDir = join(appDir, "components");
+
+    mkdirSync(componentsDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Counter is a client component (island) — uses onClick
+    writeFileSync(
+      join(componentsDir, "Counter.tsx"),
+      `"use client";\nexport default function Counter() { return <button onClick={() => {}}>Click</button>; }`,
+    );
+
+    // Component A imports B (circular) and imports Counter (island proxy needed)
+    writeFileSync(
+      join(componentsDir, "A.tsx"),
+      `import B from "./B";\nimport Counter from "./Counter";\nexport default function A() { return <span>A<Counter /></span>; }\nexport { B };`,
+    );
+
+    // Component B imports A (circular!)
+    writeFileSync(
+      join(componentsDir, "B.tsx"),
+      `import A from "./A";\nexport default function B() { return <span>B</span>; }\nexport { A };`,
+    );
+
+    // Page imports A (which triggers A→B→A cycle + island proxy for Counter)
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `import A from "./components/A";\n\nexport default function Page() { return <div><A /></div>; }`,
+    );
+
+    // The server should start without infinite recursion and the
+    // circular reference should point to a Meiden-transformed module
+    // (with `import React` prepended and island proxies rewritten),
+    // not the raw source.
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      const res = await fetchUrl(`${baseUrl}/`);
+      expect(res.status).toBe(200);
+      // A should render
+      expect(res.body).toContain("A");
+      // The Counter island should render with its data-meiden-island attribute
+      // (this verifies the cyclic reference B→A used the transformed module,
+      // not the raw source which wouldn't have island proxies)
+      expect(res.body).toContain("data-meiden-island");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test 8: Shared Dependency (not treated as circular) ─────────
+
+describe("shared dependency not treated as circular regression", () => {
+  it("should correctly handle shared dependencies: A→Shared, B→Shared should not be flagged as circular", async () => {
+    const projectRoot = join(tempRoot, "shared-dependency");
+    const appDir = join(projectRoot, "src", "app");
+    const componentsDir = join(appDir, "components");
+
+    mkdirSync(componentsDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Shared component (imported by both A and B)
+    writeFileSync(
+      join(componentsDir, "Shared.tsx"),
+      `export default function Shared() { return <span>Shared</span>; }`,
+    );
+
+    // Component A imports Shared
+    writeFileSync(
+      join(componentsDir, "A.tsx"),
+      `import Shared from "./Shared";\nexport default function A() { return <span>A<Shared /></span>; }`,
+    );
+
+    // Component B also imports Shared (not circular — just a shared dependency)
+    writeFileSync(
+      join(componentsDir, "B.tsx"),
+      `import Shared from "./Shared";\nexport default function B() { return <span>B<Shared /></span>; }`,
+    );
+
+    // Page imports both A and B
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `import A from "./components/A";\nimport B from "./components/B";\n\nexport default function Page() { return <div><A /><B /></div>; }`,
+    );
+
+    // The server should start without errors — Shared must not be
+    // treated as circular just because A and B both import it.
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      const res = await fetchUrl(`${baseUrl}/`);
+      expect(res.status).toBe(200);
+      expect(res.body).toContain("A");
+      expect(res.body).toContain("B");
+      expect(res.body).toContain("Shared");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test 6: Component Hot Reload ────────────────────────────────
+
+describe("component hot reload regression", () => {
+  it("should serve updated content after an imported component is modified (no restart)", async () => {
+    const projectRoot = join(tempRoot, "component-hot-reload");
+    const appDir = join(projectRoot, "src", "app");
+    const componentsDir = join(appDir, "components");
+
+    mkdirSync(componentsDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Component: Message.tsx (initially renders "Hello A")
+    writeFileSync(
+      join(componentsDir, "Message.tsx"),
+      `export default function Message() { return <span>Hello A</span>; }`,
+    );
+
+    // Page imports Message component
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `import Message from "./components/Message";\n\nexport default function Page() { return <div><Message /></div>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Step 1: Request / and see "Hello A"
+      const resA = await fetchUrl(`${baseUrl}/`);
+      expect(resA.status).toBe(200);
+      expect(resA.body).toContain("Hello A");
+
+      // Step 2: Edit Message.tsx to render "Hello B"
+      writeFileSync(
+        join(componentsDir, "Message.tsx"),
+        `export default function Message() { return <span>Hello B</span>; }`,
+      );
+
+      // Step 3: Wait for the file watcher to detect the component change
+      // and propagate it through the dependency graph
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      // Step 4: Request / again — should see "Hello B" without restart
+      const resB = await fetchUrl(`${baseUrl}/`);
+      expect(resB.status).toBe(200);
+      expect(resB.body).toContain("Hello B");
+      expect(resB.body).not.toContain("Hello A");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test 10: Circular Import Hot Reload (content-scoped versioning) ─
+
+describe("circular import hot reload regression", () => {
+  it("should serve updated content after a circular-import component is modified (ESM cache busted)", async () => {
+    const projectRoot = join(tempRoot, "circular-import-hmr");
+    const appDir = join(projectRoot, "src", "app");
+    const componentsDir = join(appDir, "components");
+
+    mkdirSync(componentsDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Component A imports B (circular)
+    writeFileSync(
+      join(componentsDir, "A.tsx"),
+      `import B from "./B";\nexport default function A() { return <span>Version1</span>; }\nexport { B };`,
+    );
+
+    // Component B imports A (circular!)
+    writeFileSync(
+      join(componentsDir, "B.tsx"),
+      `import A from "./A";\nexport default function B() { return <span>B</span>; }\nexport { A };`,
+    );
+
+    // Page imports A
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `import A from "./components/A";\n\nexport default function Page() { return <div><A /></div>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Step 1: Initial request — should render Version1
+      const resA = await fetchUrl(`${baseUrl}/`);
+      expect(resA.status).toBe(200);
+      expect(resA.body).toContain("Version1");
+
+      // Step 2: Edit A.tsx to render Version2
+      writeFileSync(
+        join(componentsDir, "A.tsx"),
+        `import B from "./B";\nexport default function A() { return <span>Version2</span>; }\nexport { B };`,
+      );
+
+      // Step 3: Wait for the file watcher to detect the change
+      // and propagate it through the dependency graph
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      // Step 4: Request / again — should render Version2
+      // This verifies that the content-scoped deterministic path
+      // (which includes the source hash) busts Bun's ESM cache
+      // for the cyclic reference B→A. Without content-scoped
+      // versioning, the deterministic path `route-${hash(realPath)}.tsx`
+      // would be stable across edits and Bun would return stale code.
+      const resB = await fetchUrl(`${baseUrl}/`);
+      expect(resB.status).toBe(200);
+      expect(resB.body).toContain("Version2");
+      expect(resB.body).not.toContain("Version1");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
   });
 });

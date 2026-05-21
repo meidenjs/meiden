@@ -41,9 +41,21 @@ afterAll(() => {
  */
 function findPageRouteFile(serverDir: string): string {
   const routeFiles = readdirSync(serverDir).filter((f) => f.startsWith("route-"));
+  // With recursive createServerModule, both layout and page get route-HASH.tsx
+  // files. We need to find the one that's the PAGE module. The page module
+  // is the one containing "export default function Page" or any broken import
+  // stub indicators (__meiden_stub_). The layout module just has the layout.
+  //
+  // Strategy: look for the file that contains broken-import markers
+  // (__meiden_stub_) or "export default function Page". If there's only one
+  // route file, return it.
+  if (routeFiles.length === 1) {
+    return readFileSync(join(serverDir, routeFiles[0]), "utf8");
+  }
   for (const f of routeFiles) {
     const content = readFileSync(join(serverDir, f), "utf8");
-    if (content.includes("export default function Page") || content.includes("Missing") || content.includes("NonExistent") || content.includes("NotFound")) {
+    // Page module contains either the Page function or broken-import stubs
+    if (content.includes("export default function Page") || content.includes("__meiden_stub_")) {
       return content;
     }
   }
@@ -62,7 +74,7 @@ async function generateAndReadPageRouteModule(pageSource: string): Promise<strin
   mkdirSync(appDir, { recursive: true });
 
   // Symlink node_modules from the main project so React is available
-  const nmSource = join(process.cwd(), "node_modules");
+  const nmSource = join(import.meta.dir, "..", "node_modules");
   const nmTarget = join(projectRoot, "node_modules");
   if (existsSync(nmSource) && !existsSync(nmTarget)) {
     try {
@@ -89,7 +101,8 @@ async function generateAndReadPageRouteModule(pageSource: string): Promise<strin
 
   // Start the server — this triggers createServerModule which writes files to disk
   try {
-    const { startServer } = await import("../src/dev/index.tsx");
+    const devModulePath = join(import.meta.dir, "..", "src", "dev", "index.tsx");
+    const { startServer } = await import(devModulePath);
     const app = await startServer({ root: projectRoot, port: 0 });
     app.stop?.();
   } catch {
@@ -176,11 +189,14 @@ export default function Page() {
 
     // Should create Mod
     expect(generated).toContain("const Mod");
-    // Namespace stubs use Proxy({}, ...) — no function() {} base
+    // All stubs use Proxy with a plain object target (not function() {} base)
+    // The target includes toString/valueOf/Symbol.toPrimitive for JSX child safety
     const modLines = generated.split("\n").filter(
-      (l) => l.includes("const __meiden_stub_") && l.includes("new Proxy({},"),
+      (l) => l.includes("const __meiden_stub_") && l.includes("new Proxy("),
     );
     expect(modLines.length).toBeGreaterThan(0);
+    // No stub should contain "function() {}" base — all use plain objects
+    expect(modLines.some(l => l.includes("function() {}"))).toBe(false);
   });
 
   it("should remove side-effect imports without creating bindings", async () => {
@@ -219,5 +235,29 @@ export default function Page() {
     // Should contain the error message about the unresolved import
     expect(generated).toContain("Cannot resolve import");
     expect(generated).toContain("./NotFound");
+  });
+
+  it("should throw when broken import is rendered as JSX child (toString/valueOf/Symbol.toPrimitive traps)", async () => {
+    const page = `
+import Missing from "./Missing";
+
+export default function Page() {
+  return <div>{Missing}</div>;
+}
+`;
+
+    const generated = await generateAndReadPageRouteModule(page);
+
+    // The stub must include primitive-conversion traps so React throws
+    // when trying to render the broken import as a JSX text child.
+    // Without these, React would call toString() on the Proxy target
+    // (which returns "[object Object]" or "function() {}") and render 200.
+    expect(generated).toContain("toString()");
+    expect(generated).toContain("valueOf()");
+    expect(generated).toContain("Symbol.toPrimitive");
+
+    // Should still have Proxy and error message
+    expect(generated).toContain("new Proxy");
+    expect(generated).toContain("Cannot resolve import");
   });
 });
