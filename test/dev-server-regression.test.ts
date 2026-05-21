@@ -1036,6 +1036,59 @@ describe("URL-encoded params regression", () => {
   });
 });
 
+// ─── Test 19: Malformed Percent-Encoded Params ─────────────────────
+
+describe("malformed percent-encoded params regression", () => {
+  it("should return 404 for malformed percent-encoded URL params (no unhandled throw)", async () => {
+    const projectRoot = join(tempRoot, "malformed-encoding");
+    const appDir = join(projectRoot, "src", "app");
+    const blogSlugDir = join(appDir, "blog", "[slug]");
+
+    mkdirSync(blogSlugDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Dynamic blog page
+    writeFileSync(
+      join(blogSlugDir, "page.tsx"),
+      `export default function BlogPost({ params }: { params: { slug: string } }) { return <span>Slug:{params.slug}</span>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Valid encoded param should still work
+      const validRes = await fetchUrl(`${baseUrl}/blog/hello%20world`);
+      expect(validRes.status).toBe(200);
+      expect(validRes.body).toContain("hello world");
+
+      // Malformed percent-encoding: %E0%A4%A is an incomplete UTF-8 sequence
+      // This should NOT throw an unhandled error — instead it should return 404
+      // because safeDecodeParam returns null → matchRoute returns undefined
+      const malformedRes = await fetchUrl(`${baseUrl}/blog/%E0%A4%A`);
+      expect(malformedRes.status).toBe(404);
+
+      // Another malformed case: lone percent sign
+      const lonePercentRes = await fetchUrl(`${baseUrl}/blog/test%`);
+      expect(lonePercentRes.status).toBe(404);
+
+      // Valid encoding should still work after malformed attempts
+      const validAgainRes = await fetchUrl(`${baseUrl}/blog/valid-slug`);
+      expect(validAgainRes.status).toBe(200);
+      expect(validAgainRes.body).toContain("valid-slug");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 // ─── Test 18: [...path] requires at least one segment ───────────────
 
 describe("catch-all [...path] requires at least one segment regression", () => {

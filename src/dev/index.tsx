@@ -1256,6 +1256,27 @@ function buildRouteManifestEntry(appDir: string, filePath: string): RouteManifes
 }
 
 /**
+ * Safely decode a URL-encoded param value. Returns the decoded string
+ * on success, or null if the value contains malformed percent-encoding
+ * (e.g. `%E0%A4%A` — incomplete UTF-8 sequence). Returning null signals
+ * to matchRoute() that this URL should be treated as "no match" (→ 404),
+ * which is safer than:
+ *   - Letting decodeURIComponent throw (matchRoute is called before the
+ *     SSR try/catch, so the error would escape normal handling)
+ *   - Silently passing the raw encoded value through (page components
+ *     would receive garbled data like "hello%20world" instead of "hello world")
+ *   - Returning the raw value on failure (inconsistent — some params
+ *     decoded, others not)
+ */
+function safeDecodeParam(value: string): string | null {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Match a URL pathname against the route manifest and return the
  * matching entry plus extracted params.
  *
@@ -1292,7 +1313,18 @@ function matchRoute(
         // receive decoded params. For example, /blog/hello%20world
         // should produce { slug: "hello world" }, not "hello%20world".
         // The ?? "" is a safety fallback for unexpected edge cases.
-        params[paramName] = captured ? decodeURIComponent(captured) : "";
+        // Uses safeDecodeParam instead of raw decodeURIComponent so
+        // that malformed percent-encoded URLs (e.g. /blog/%E0%A4%A)
+        // don't throw an unhandled URIError. Since matchRoute() is
+        // called before the SSR try/catch block, a raw
+        // decodeURIComponent crash would escape the normal error
+        // handling path. On decode failure we treat the route as
+        // "no match" (return undefined) which results in a 404 —
+        // this is safer than passing the raw encoded value through
+        // or letting the error propagate.
+        const decoded = captured ? safeDecodeParam(captured) : "";
+        if (decoded === null) return undefined; // malformed encoding → no match
+        params[paramName] = decoded;
       }
       return { entry, params };
     }
