@@ -233,3 +233,109 @@ describe("missing config/app-dir diagnostics regression", () => {
     expect(message).toContain("meiden.config");
   });
 });
+
+// ─── Test 4: Broken Import JSX Child Returns 500 ──────────────────
+
+describe("broken import JSX child regression", () => {
+  it("should return 500 when broken import is rendered as JSX child", async () => {
+    const projectRoot = join(tempRoot, "broken-import-jsx-child");
+    const appDir = join(projectRoot, "src", "app");
+    const brokenDir = join(appDir, "broken");
+
+    mkdirSync(brokenDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Valid page at /
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+
+    // Page with broken import used as JSX child at /broken
+    writeFileSync(
+      join(brokenDir, "page.tsx"),
+      `import Missing from "./NonExistent";
+
+export default function Page() {
+  return <div>{Missing}</div>;
+}`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Valid route should return 200
+      const homeRes = await fetchUrl(`${baseUrl}/`);
+      expect(homeRes.status).toBe(200);
+      expect(homeRes.body).toContain("Home");
+
+      // Broken import as JSX child should trigger 500
+      // (toString/valueOf/Symbol.toPrimitive traps on the Proxy stub throw)
+      const brokenRes = await fetchUrl(`${baseUrl}/broken`);
+      expect(brokenRes.status).toBe(500);
+      expect(brokenRes.body).toContain("Cannot resolve import");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test 5: Hot Reload ──────────────────────────────────────────
+
+describe("hot reload regression", () => {
+  it("should serve updated content after page file is modified (no restart)", async () => {
+    const projectRoot = join(tempRoot, "hot-reload");
+    const appDir = join(projectRoot, "src", "app");
+
+    mkdirSync(appDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Initial page content
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Content A</h1>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Step 1: Request / and get Content A
+      const resA = await fetchUrl(`${baseUrl}/`);
+      expect(resA.status).toBe(200);
+      expect(resA.body).toContain("Content A");
+
+      // Step 2: Edit page.tsx to Content B
+      writeFileSync(
+        join(appDir, "page.tsx"),
+        `export default function Page() { return <h1>Content B</h1>; }`,
+      );
+
+      // Step 3: Wait for the file watcher to detect the change
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      // Step 4: Request / again — should get Content B
+      const resB = await fetchUrl(`${baseUrl}/`);
+      expect(resB.status).toBe(200);
+      expect(resB.body).toContain("Content B");
+      expect(resB.body).not.toContain("Content A");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});

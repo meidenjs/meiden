@@ -176,11 +176,14 @@ export default function Page() {
 
     // Should create Mod
     expect(generated).toContain("const Mod");
-    // Namespace stubs use Proxy({}, ...) — no function() {} base
+    // All stubs use Proxy with a plain object target (not function() {} base)
+    // The target includes toString/valueOf/Symbol.toPrimitive for JSX child safety
     const modLines = generated.split("\n").filter(
-      (l) => l.includes("const __meiden_stub_") && l.includes("new Proxy({},"),
+      (l) => l.includes("const __meiden_stub_") && l.includes("new Proxy("),
     );
     expect(modLines.length).toBeGreaterThan(0);
+    // No stub should contain "function() {}" base — all use plain objects
+    expect(modLines.some(l => l.includes("function() {}"))).toBe(false);
   });
 
   it("should remove side-effect imports without creating bindings", async () => {
@@ -219,5 +222,29 @@ export default function Page() {
     // Should contain the error message about the unresolved import
     expect(generated).toContain("Cannot resolve import");
     expect(generated).toContain("./NotFound");
+  });
+
+  it("should throw when broken import is rendered as JSX child (toString/valueOf/Symbol.toPrimitive traps)", async () => {
+    const page = `
+import Missing from "./Missing";
+
+export default function Page() {
+  return <div>{Missing}</div>;
+}
+`;
+
+    const generated = await generateAndReadPageRouteModule(page);
+
+    // The stub must include primitive-conversion traps so React throws
+    // when trying to render the broken import as a JSX text child.
+    // Without these, React would call toString() on the Proxy target
+    // (which returns "[object Object]" or "function() {}") and render 200.
+    expect(generated).toContain("toString()");
+    expect(generated).toContain("valueOf()");
+    expect(generated).toContain("Symbol.toPrimitive");
+
+    // Should still have Proxy and error message
+    expect(generated).toContain("new Proxy");
+    expect(generated).toContain("Cannot resolve import");
   });
 });

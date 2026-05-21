@@ -11,6 +11,7 @@ import {
   readdirSync,
   rmSync,
   statSync,
+  watch,
   writeFileSync,
 } from "node:fs";
 import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
@@ -775,13 +776,21 @@ function createServerModule(root: string, filePath: string) {
           const stubVar = `__meiden_stub_${imp.start}_${i}`;
           const localName = binding.localName;
 
-          if (binding.kind === "namespace") {
-            // Namespace: Proxy on a plain object (no apply trap needed)
-            return `const ${stubVar} = new Proxy({}, { get: () => { throw new Error("${errMsg}"); } });\nconst ${localName} = ${stubVar};`;
-          }
+          // All stubs use a plain object target with toString/valueOf/
+          // Symbol.toPrimitive methods that throw. This ensures that:
+          //
+          //   <div>{Missing}</div>  → React calls Missing.toString() → throw → 500
+          //   <Missing />           → React sees typeof !== "function" → "Element type is invalid" → throw → 500
+          //   Missing.someProp      → Proxy get trap → throw → 500
+          //   Missing()             → TypeError: Missing is not a function → 500
+          //
+          // We deliberately do NOT use a function target because React SSR
+          // skips functions rendered as JSX children (just warns, returns 200).
+          // Using an object target forces React into the toString() path which
+          // our throwing methods intercept.
+          const throwTarget = `{\n  toString() { throw new Error("${errMsg}"); },\n  valueOf() { throw new Error("${errMsg}"); },\n  [Symbol.toPrimitive]() { throw new Error("${errMsg}"); },\n}`;
 
-          // Default and named: Proxy on a function (so it can be called)
-          return `const ${stubVar} = new Proxy(function() {}, { get: () => { throw new Error("${errMsg}"); }, apply: () => { throw new Error("${errMsg}"); } });\nconst ${localName} = ${stubVar};`;
+          return `const ${stubVar} = new Proxy(${throwTarget}, { get: () => { throw new Error("${errMsg}"); } });\nconst ${localName} = ${stubVar};`;
         }).join("\n");
 
         replacements.push({ start: imp.start, end: imp.end, text: stubDecl });
@@ -1533,14 +1542,105 @@ export function startProductionServer({ root, outDir = "dist", port = 3000 }: Pr
 const MAX_CONCURRENT_REQUESTS = 100;
 let inFlightRequests = 0;
 
+/**
+ * Mutable route store — route handlers read from this object so that
+ * hot reload can update it without re-registering Elysia routes.
+ */
+interface RouteStore {
+  RootLayout: Component<{ children: unknown }>;
+  routes: Map<string, AppRoute>; // path → route (for O(1) lookup)
+}
+
+/**
+ * Hot-reload a single page module. Regenerates the server module,
+ * re-imports it, and updates the route store. Errors are logged but
+ * do not crash the server — the old route stays active until the
+ * broken file is fixed.
+ */
+async function hotReloadPage(
+  projectRoot: string,
+  config: MeidenConfig,
+  routeStore: RouteStore,
+  filePath: string,
+) {
+  const appDir = resolveAppDir(projectRoot, config);
+  const routePath = toRoutePath(appDir, filePath);
+
+  try {
+    const serverModulePath = createServerModule(projectRoot, filePath);
+    const pageModule = await import(pathToFileURL(serverModulePath).href);
+
+    if (!pageModule.default) {
+      console.warn(`[meiden] Hot reload: page has no default export: ${filePath}`);
+      routeStore.routes.set(routePath, {
+        path: routePath,
+        Page: () => {
+          throw new Error(`Page missing default export: ${filePath}`);
+        },
+        filePath,
+      });
+      return;
+    }
+
+    routeStore.routes.set(routePath, {
+      path: routePath,
+      Page: pageModule.default,
+      filePath,
+    });
+    console.log(`[meiden] Hot reload: ${routePath}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[meiden] Hot reload failed for ${filePath}: ${message}`);
+    // Keep the old route active — don't break the server
+  }
+}
+
+/**
+ * Hot-reload the layout module. Regenerates the server module,
+ * re-imports it, and updates the route store's RootLayout.
+ */
+async function hotReloadLayout(
+  projectRoot: string,
+  config: MeidenConfig,
+  routeStore: RouteStore,
+) {
+  const appDir = resolveAppDir(projectRoot, config);
+
+  try {
+    const layoutModule = await import(
+      pathToFileURL(createServerModule(projectRoot, resolveAppModule(appDir, "layout"))).href
+    );
+
+    if (!layoutModule.default) {
+      console.error("[meiden] Hot reload: layout has no default export — keeping old layout");
+      return;
+    }
+
+    routeStore.RootLayout = layoutModule.default;
+    console.log("[meiden] Hot reload: layout");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[meiden] Hot reload failed for layout: ${message}`);
+  }
+}
+
 export async function startServer({ root, port = 3000 }: StartServerOptions) {
   const projectRoot = resolve(root);
   const config = await loadConfig(projectRoot);
-  const { RootLayout, routes } = await loadAppModules(projectRoot, config);
-  const LayoutWrapper = createLayoutWrapper(RootLayout);
+  const { RootLayout, routes: initialRoutes } = await loadAppModules(projectRoot, config);
+
+  // Mutable route store — hot reload updates this in-place.
+  // Route handlers read from this store instead of closing over
+  // fixed values, so they always serve the latest version.
+  const routeStore: RouteStore = {
+    RootLayout,
+    routes: new Map(initialRoutes.map(r => [r.path, r])),
+  };
 
   const publicDir = join(projectRoot, "public");
   const hasPublicDir = existsSync(publicDir);
+
+  const appDir = resolveAppDir(projectRoot, config);
 
   const app = new Elysia().use(html());
 
@@ -1590,12 +1690,21 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
     return buildIslandModule(projectRoot, decodeURIComponent(params.source), String(query.name ?? "default"));
   });
 
-  for (const route of routes) {
+  // Register routes that read from the mutable routeStore.
+  // When hot reload updates routeStore, the next request will
+  // automatically use the new module without re-registering routes.
+  for (const route of initialRoutes) {
     app.get(route.path, async ({ request, set }) => {
       const startedAt = performance.now();
+      // Look up the latest version of this route from the store
+      const currentRoute = routeStore.routes.get(route.path) ?? route;
 
       try {
-        const page = <LayoutWrapper Page={route.Page} />;
+        // Create a fresh LayoutWrapper each request using the current RootLayout
+        // from the mutable store. This ensures hot-reloaded layouts take effect
+        // immediately without restarting the server.
+        const CurrentLayoutWrapper = createLayoutWrapper(routeStore.RootLayout);
+        const page = <CurrentLayoutWrapper Page={currentRoute.Page} />;
         const html = await renderReact(projectRoot, page);
         logRequest(request.method, route.path, 200, startedAt);
 
@@ -1647,6 +1756,66 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
   });
 
   app.listen(port);
+
+  // ─── Hot Reload: file watcher ──────────────────────────────────────
+  //
+  // Watch the app directory for changes. When a page or layout file
+  // changes, regenerate the server module, re-import it, and update
+  // the mutable routeStore. The next request will use the new code.
+  //
+  // Debouncing: file editors often trigger multiple change events
+  // (write + rename, or multiple writes). We debounce by 100ms to
+  // avoid redundant reloads.
+  if (existsSync(appDir)) {
+    let reloadTimer: ReturnType<typeof setTimeout> | null = null;
+    const changedFiles = new Set<string>();
+
+    const watcher = watch(appDir, { recursive: true }, (event, filename) => {
+      if (!filename) return;
+
+      const filePath = join(appDir, filename);
+
+      // Only react to source files
+      if (!moduleExtensions.some(ext => filePath.endsWith(ext))) return;
+
+      // Check if this is a route-relevant file (page.* or layout.*)
+      const isLayout = /(^|\/)layout\.(tsx|ts|jsx|js)$/.test(filePath);
+      const isPage = routeFilePattern.test(filePath);
+      if (!isLayout && !isPage) return;
+
+      changedFiles.add(filePath);
+
+      // Debounce: collect all changed files within 100ms and reload once
+      if (reloadTimer) clearTimeout(reloadTimer);
+      reloadTimer = setTimeout(async () => {
+        reloadTimer = null;
+        const files = [...changedFiles];
+        changedFiles.clear();
+
+        for (const file of files) {
+          if (!existsSync(file)) {
+            // File was deleted — skip (route stays with old module)
+            console.log(`[meiden] Hot reload: file deleted ${file}, keeping old module`);
+            continue;
+          }
+
+          const isLayoutFile = /(^|\/)layout\.(tsx|ts|jsx|js)$/.test(file);
+          if (isLayoutFile) {
+            await hotReloadLayout(projectRoot, config, routeStore);
+          } else {
+            await hotReloadPage(projectRoot, config, routeStore, file);
+          }
+        }
+      }, 100);
+    });
+
+    // Clean up watcher when the server stops
+    const originalStop = app.stop?.bind(app);
+    app.stop = () => {
+      watcher.close();
+      originalStop?.();
+    };
+  }
 
   return app;
 }
