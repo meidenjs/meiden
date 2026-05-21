@@ -597,6 +597,25 @@ function createIslandProxy(root: string, sourcePath: string, exportNames: string
   const tmpDir = join(root, ".meiden", "server");
   mkdirSync(tmpDir, { recursive: true });
 
+  // Transform the client component through createServerModule() to get a
+  // content-hashed SSR copy. This recursively transforms all relative
+  // imports (both client and non-client) so the entire dependency chain
+  // is content-hashed. When any dependency of the island changes:
+  //   1. Its server module gets a new hash
+  //   2. The island's import specifier changes → island server module hash changes
+  //   3. The proxy's import specifier changes → proxy hash changes
+  //   4. The page's import specifier changes → page server module hash changes
+  //   5. Bun loads fresh code all the way down
+  //
+  // Previously, the island proxy imported the client component via a stable
+  // raw source path, so Bun's ESM cache returned stale code after edits.
+  // An intermediate createIslandSourceModule() only hashed the island's own
+  // source and rewrote relative imports to absolute paths — but nested
+  // dependency changes didn't propagate because those absolute paths were
+  // also stable. Using createServerModule() fixes both direct edits to the
+  // island source AND edits to its nested dependencies.
+  const hashedSourcePath = createServerModule(root, sourcePath);
+
   // If exportNames contains "*", resolve to actual module exports.
   // This handles namespace imports like `import * as Counter from "./Counter"`
   // where "*" would otherwise become an invalid function name.
@@ -617,7 +636,7 @@ function createIslandProxy(root: string, sourcePath: string, exportNames: string
 
   const source = escapeJsString(relative(root, sourcePath).replaceAll("\\", "/"));
   const uniqueExports = [...new Set(resolvedExportNames.length > 0 ? resolvedExportNames : ["default"])];
-  const absolutePath = escapeJsString(sourcePath.replaceAll("\\", "/"));
+  const absolutePath = escapeJsString(hashedSourcePath.replaceAll("\\", "/"));
 
   // Synchronous proxy functions that use the module loaded via top-level await.
   // If import failed, the function returns a placeholder div.
