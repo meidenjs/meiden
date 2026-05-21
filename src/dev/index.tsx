@@ -737,6 +737,73 @@ ${exports.join("\n")}
  * - Multi-line imports
  * - Import comments
  */
+/**
+ * Dependency graph: maps a server module's source file path to the set of
+ * source file paths that import it (directly or indirectly). Used by the
+ * hot-reload watcher to find which page/layout modules need to be
+ * re-imported when a component file changes.
+ */
+const dependencyGraph = new Map<string, Set<string>>();
+
+/** Register that `importerPath` imports `dependencyPath`. */
+function registerDependency(importerPath: string, dependencyPath: string) {
+  if (!dependencyGraph.has(dependencyPath)) {
+    dependencyGraph.set(dependencyPath, new Set());
+  }
+  dependencyGraph.get(dependencyPath)!.add(importerPath);
+}
+
+/**
+ * Clear all dependency edges where `importerPath` is the importer.
+ * Called before re-transforming a file during hot reload so that
+ * stale edges (from imports that were removed) don't linger.
+ */
+function clearDependenciesOf(importerPath: string) {
+  for (const dependents of dependencyGraph.values()) {
+    dependents.delete(importerPath);
+  }
+}
+
+/**
+ * Find all source files that transitively depend on `sourcePath`.
+ * Walks the dependency graph upward to find the root importers
+ * (page/layout files). Returns a set of absolute file paths.
+ */
+function findDependents(sourcePath: string): Set<string> {
+  const visited = new Set<string>();
+  const result = new Set<string>();
+
+  function walk(path: string) {
+    if (visited.has(path)) return;
+    visited.add(path);
+
+    const dependents = dependencyGraph.get(path);
+    if (dependents) {
+      for (const dep of dependents) {
+        result.add(dep);
+        walk(dep);
+      }
+    }
+  }
+
+  walk(sourcePath);
+  return result;
+}
+
+/**
+ * Create a server-side version of a module by rewriting imports.
+ *
+ * For page/layout files: rewrites client component imports to island proxies,
+ * unresolvable imports to throwing Proxy stubs, and recursively transforms
+ * non-client relative imports through `createServerModule` so that the
+ * entire import chain is content-hashed. This creates a cascade: when a
+ * component changes, its server module gets a new hash → the importing
+ * page's specifier changes → the page's server module gets a new hash →
+ * Bun's dynamic `import()` loads the fresh code instead of the cached version.
+ *
+ * For component/utility files: same logic applies — all relative imports
+ * are recursively transformed, so deep dependency chains are fully tracked.
+ */
 function createServerModule(root: string, filePath: string) {
   const tmpDir = join(root, ".meiden", "server");
   mkdirSync(tmpDir, { recursive: true });
@@ -744,6 +811,11 @@ function createServerModule(root: string, filePath: string) {
   const realPath = toPath(filePath);
   const source = readFileSync(realPath, "utf8");
   const imports = parseImports(realPath);
+
+  // Clear stale dependency edges for this file before re-registering.
+  // This handles the case where a hot-reloaded file removed an import
+  // — without clearing, the old edge would remain in the graph.
+  clearDependenciesOf(realPath);
 
   // Build replacements from end to start so offsets stay valid
   const replacements: Array<{ start: number; end: number; text: string }> = [];
@@ -803,10 +875,22 @@ function createServerModule(root: string, filePath: string) {
       // Replace just the specifier part of the import
       const newStatement = imp.statement.replace(imp.specifier, proxyPath);
       replacements.push({ start: imp.start, end: imp.end, text: newStatement });
-    } else {
-      // Rewrite relative imports to absolute paths for server-side resolution
-      const newStatement = imp.statement.replace(imp.specifier, resolvedImport);
+    } else if (imp.specifier.startsWith(".")) {
+      // Recursively transform relative non-client imports so that the
+      // entire import chain is content-hashed. When a component changes,
+      // its server module gets a new hash → the importing file's specifier
+      // changes → its server module also gets a new hash → Bun's import()
+      // loads fresh code instead of the cached version.
+      //
+      // Also register the dependency relationship so that the hot-reload
+      // watcher can find which pages need re-importing when this component
+      // changes.
+      registerDependency(realPath, resolvedImport);
+      const depServerPath = createServerModule(root, resolvedImport);
+      const newStatement = imp.statement.replace(imp.specifier, depServerPath);
       replacements.push({ start: imp.start, end: imp.end, text: newStatement });
+    } else {
+      // Non-relative imports (node_modules, built-ins): leave as-is
     }
   }
 
@@ -1624,6 +1708,51 @@ async function hotReloadLayout(
   }
 }
 
+/**
+ * Hot-reload a component (or any non-page/layout) file. Uses the
+ * dependency graph to find all pages and layouts that import this
+ * file (directly or transitively), then re-imports each one.
+ *
+ * Because createServerModule recursively transforms the entire import
+ * chain with content-hashed filenames, changing a component produces
+ * a new component server module with a new hash → the page's import
+ * specifier changes → the page's server module gets a new hash →
+ * Bun's import() loads fresh code instead of the cached version.
+ *
+ * If no dependents are found (e.g. a new file that hasn't been
+ * imported yet), this is a no-op.
+ */
+async function hotReloadComponent(
+  projectRoot: string,
+  config: MeidenConfig,
+  routeStore: RouteStore,
+  filePath: string,
+) {
+  // findDependents walks transitively, so we get all direct and
+  // indirect dependents (including pages/layouts that import the
+  // component through intermediate files).
+  const dependents = findDependents(filePath);
+  if (dependents.size === 0) {
+    console.log(`[meiden] Hot reload: ${filePath} changed but no dependents found`);
+    return;
+  }
+
+  const layoutPattern = /(^|\/)layout\.(tsx|ts|jsx|js)$/;
+
+  for (const depPath of dependents) {
+    if (!existsSync(depPath)) continue;
+
+    if (layoutPattern.test(depPath)) {
+      await hotReloadLayout(projectRoot, config, routeStore);
+    } else if (routeFilePattern.test(depPath)) {
+      await hotReloadPage(projectRoot, config, routeStore, depPath);
+    }
+    // Intermediate (non-page, non-layout) dependents don't need
+    // explicit handling — they are automatically re-transformed when
+    // createServerModule runs recursively for the page/layout.
+  }
+}
+
 export async function startServer({ root, port = 3000 }: StartServerOptions) {
   const projectRoot = resolve(root);
   const config = await loadConfig(projectRoot);
@@ -1759,16 +1888,34 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
 
   // ─── Hot Reload: file watcher ──────────────────────────────────────
   //
-  // Watch the app directory for changes. When a page or layout file
-  // changes, regenerate the server module, re-import it, and update
-  // the mutable routeStore. The next request will use the new code.
+  // Watch the app directory for changes. When a page, layout, or
+  // component file changes, regenerate the server module, re-import
+  // it, and update the mutable routeStore. The next request will use
+  // the new code.
+  //
+  // Component hot reload: when a non-page/layout file (e.g. a
+  // component) changes, we use the dependency graph to find all
+  // pages/layouts that import it (directly or transitively), then
+  // re-import those modules. Because createServerModule recursively
+  // transforms the entire import chain with content-hashed filenames,
+  // changing a component → new component server module hash → new
+  // import specifier in the page → new page server module hash →
+  // Bun's import() loads fresh code.
   //
   // Debouncing: file editors often trigger multiple change events
   // (write + rename, or multiple writes). We debounce by 100ms to
   // avoid redundant reloads.
+  //
+  // Limitations:
+  //   - Adding a new route while the server is running does NOT
+  //     register it (routes are only scanned at startup).
+  //   - Deleting a route file keeps the old route active.
+  //   - Only editing existing routes/components triggers hot reload.
   if (existsSync(appDir)) {
     let reloadTimer: ReturnType<typeof setTimeout> | null = null;
     const changedFiles = new Set<string>();
+
+    const layoutPattern = /(^|\/)layout\.(tsx|ts|jsx|js)$/;
 
     const watcher = watch(appDir, { recursive: true }, (event, filename) => {
       if (!filename) return;
@@ -1778,11 +1925,9 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
       // Only react to source files
       if (!moduleExtensions.some(ext => filePath.endsWith(ext))) return;
 
-      // Check if this is a route-relevant file (page.* or layout.*)
-      const isLayout = /(^|\/)layout\.(tsx|ts|jsx|js)$/.test(filePath);
-      const isPage = routeFilePattern.test(filePath);
-      if (!isLayout && !isPage) return;
-
+      // All source files in appDir are watched — pages, layouts,
+      // components, utilities. Component changes are resolved via
+      // the dependency graph.
       changedFiles.add(filePath);
 
       // Debounce: collect all changed files within 100ms and reload once
@@ -1799,11 +1944,17 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
             continue;
           }
 
-          const isLayoutFile = /(^|\/)layout\.(tsx|ts|jsx|js)$/.test(file);
+          const isLayoutFile = layoutPattern.test(file);
+          const isPageFile = routeFilePattern.test(file);
+
           if (isLayoutFile) {
             await hotReloadLayout(projectRoot, config, routeStore);
-          } else {
+          } else if (isPageFile) {
             await hotReloadPage(projectRoot, config, routeStore, file);
+          } else {
+            // Component/utility file changed — find all pages/layouts
+            // that depend on it and re-import them.
+            await hotReloadComponent(projectRoot, config, routeStore, file);
           }
         }
       }, 100);

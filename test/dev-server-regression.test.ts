@@ -35,7 +35,9 @@ afterAll(() => {
 
 /** Symlink node_modules from the main project so React is available */
 function symlinkNodeModules(projectRoot: string) {
-  const nmSource = join(process.cwd(), "node_modules");
+  // Use import.meta.dir to find node_modules relative to this test file,
+  // not process.cwd() which may differ depending on how bun test is invoked.
+  const nmSource = join(import.meta.dir, "..", "node_modules");
   const nmTarget = join(projectRoot, "node_modules");
   if (existsSync(nmSource) && !existsSync(nmTarget)) {
     try {
@@ -68,7 +70,8 @@ function writePackageJson(projectRoot: string) {
 async function startDevServer(
   projectRoot: string,
 ): Promise<{ baseUrl: string; app: any }> {
-  const { startServer } = await import("../src/dev/index.tsx");
+  const devModulePath = join(import.meta.dir, "..", "src", "dev", "index.tsx");
+  const { startServer } = await import(devModulePath);
   const app = await startServer({ root: projectRoot, port: 0 });
 
   // Elysia stores the Bun server on app.server
@@ -206,7 +209,8 @@ describe("missing config/app-dir diagnostics regression", () => {
 
     let thrownError: Error | null = null;
     try {
-      const { startServer } = await import("../src/dev/index.tsx");
+      const devModulePath = join(import.meta.dir, "..", "src", "dev", "index.tsx");
+      const { startServer } = await import(devModulePath);
       await startServer({ root: projectRoot, port: 0 });
     } catch (error) {
       thrownError = error instanceof Error ? error : new Error(String(error));
@@ -333,6 +337,66 @@ describe("hot reload regression", () => {
       expect(resB.status).toBe(200);
       expect(resB.body).toContain("Content B");
       expect(resB.body).not.toContain("Content A");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test 6: Component Hot Reload ────────────────────────────────
+
+describe("component hot reload regression", () => {
+  it("should serve updated content after an imported component is modified (no restart)", async () => {
+    const projectRoot = join(tempRoot, "component-hot-reload");
+    const appDir = join(projectRoot, "src", "app");
+    const componentsDir = join(appDir, "components");
+
+    mkdirSync(componentsDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Component: Message.tsx (initially renders "Hello A")
+    writeFileSync(
+      join(componentsDir, "Message.tsx"),
+      `export default function Message() { return <span>Hello A</span>; }`,
+    );
+
+    // Page imports Message component
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `import Message from "./components/Message";\n\nexport default function Page() { return <div><Message /></div>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Step 1: Request / and see "Hello A"
+      const resA = await fetchUrl(`${baseUrl}/`);
+      expect(resA.status).toBe(200);
+      expect(resA.body).toContain("Hello A");
+
+      // Step 2: Edit Message.tsx to render "Hello B"
+      writeFileSync(
+        join(componentsDir, "Message.tsx"),
+        `export default function Message() { return <span>Hello B</span>; }`,
+      );
+
+      // Step 3: Wait for the file watcher to detect the component change
+      // and propagate it through the dependency graph
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      // Step 4: Request / again — should see "Hello B" without restart
+      const resB = await fetchUrl(`${baseUrl}/`);
+      expect(resB.status).toBe(200);
+      expect(resB.body).toContain("Hello B");
+      expect(resB.body).not.toContain("Hello A");
     } finally {
       app.stop?.();
       rmSync(projectRoot, { recursive: true, force: true });
