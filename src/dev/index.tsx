@@ -1150,7 +1150,9 @@ function resolveAppDir(root: string, config: MeidenConfig) {
  *
  * The bracket notation follows Next.js App Router conventions:
  * - [param] matches a single path segment (no slashes)
- * - [...param] matches zero or more path segments (catch-all)
+ * - [...param] matches one or more path segments (required catch-all)
+ *   Note: Next.js also has [[...param]] for optional catch-all, which
+ *   Meiden does not currently support.
  */
 function parseSegment(raw: string): RouteSegment {
   // Catch-all: [...param]
@@ -1189,7 +1191,7 @@ function parseSegment(raw: string): RouteSegment {
  *   app/page.tsx              → path: "/", pattern: /^\/$/, params: []
  *   app/about/page.tsx        → path: "/about", pattern: /^\/about$/, params: []
  *   app/blog/[slug]/page.tsx  → path: "/blog/[slug]", pattern: /^\/blog\/([^/]+)$/, params: ["slug"]
- *   app/docs/[...path]/page.tsx → path: "/docs/[...path]", pattern: /^\/docs(?:\/(.+))?$/, params: ["path"]
+ *   app/docs/[...path]/page.tsx → path: "/docs/[...path]", pattern: /^\/docs\/([^/]+(?:\/[^/]+)*)$/, params: ["path"]
  */
 function buildRouteManifestEntry(appDir: string, filePath: string): RouteManifestEntry {
   const relativePath = filePath.slice(appDir.length + 1);
@@ -1229,13 +1231,12 @@ function buildRouteManifestEntry(appDir: string, filePath: string): RouteManifes
       // [param] matches exactly one non-slash segment
       patternStr += "([^/]+)";
     } else if (seg.kind === "wildcard") {
-      // [...param] matches zero or more segments (including slashes)
-      // The (?:...)? makes the entire segment optional so /docs matches
-      // /docs/[...path] (empty catch-all).
-      // We backtrack the \\/ we already added and wrap the whole thing
-      // in an optional non-capturing group.
-      patternStr = patternStr.slice(0, -2); // remove the trailing \\/
-      patternStr += `(?:\\/([^/]+(?:\\/[^/]+)*))?`;
+      // [...param] matches one or more segments (including slashes).
+      // This follows Next.js App Router convention where `[...param]`
+      // requires at least one segment, while `[[...param]]` is the
+      // optional catch-all. Meiden does not currently support the
+      // optional `[[...param]]` syntax.
+      patternStr += "([^/]+(?:\\/[^/]+)*)";
     }
   }
   patternStr += "$";
@@ -1266,7 +1267,7 @@ function buildRouteManifestEntry(appDir: string, filePath: string): RouteManifes
  * Returns { entry, params } on match, or undefined if no route matches.
  * The params object maps param names to their extracted values:
  *   - [slug] → { slug: "hello" }
- *   - [...path] → { path: "a/b/c" } (string with slashes)
+ *   - [...path] → { path: "a/b/c" } (string with slashes, at least one segment required)
  */
 function matchRoute(
   pathname: string,
@@ -1287,9 +1288,11 @@ function matchRoute(
       for (let i = 0; i < entry.params.length; i++) {
         const paramName = entry.params[i];
         const captured = match[i + 1];
-        // For wildcards, captured may be undefined when the catch-all
-        // matches zero segments (e.g. /docs matching /docs/[...path])
-        params[paramName] = captured ?? "";
+        // URL-decode the captured value so that page components
+        // receive decoded params. For example, /blog/hello%20world
+        // should produce { slug: "hello world" }, not "hello%20world".
+        // The ?? "" is a safety fallback for unexpected edge cases.
+        params[paramName] = captured ? decodeURIComponent(captured) : "";
       }
       return { entry, params };
     }

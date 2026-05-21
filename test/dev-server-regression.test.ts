@@ -991,3 +991,94 @@ describe("multiple dynamic segments regression", () => {
     }
   });
 });
+
+// ─── Test 17: URL-Encoded Params ────────────────────────────────────
+
+describe("URL-encoded params regression", () => {
+  it("should URL-decode params before passing to page components", async () => {
+    const projectRoot = join(tempRoot, "url-encoded-params");
+    const appDir = join(projectRoot, "src", "app");
+    const blogSlugDir = join(appDir, "blog", "[slug]");
+
+    mkdirSync(blogSlugDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Page that renders the decoded slug with clear delimiters
+    writeFileSync(
+      join(blogSlugDir, "page.tsx"),
+      `export default function BlogPost({ params }: { params: { slug: string } }) { return <span>SLUG:{params.slug}:END</span>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Space encoding: %20 → should decode to space
+      const spaceRes = await fetchUrl(`${baseUrl}/blog/hello%20world`);
+      expect(spaceRes.status).toBe(200);
+      expect(spaceRes.body).toContain("hello world");
+      expect(spaceRes.body).not.toContain("hello%20world");
+
+      // Plus sign: %2B → should decode to +
+      const plusRes = await fetchUrl(`${baseUrl}/blog/1%2B1`);
+      expect(plusRes.status).toBe(200);
+      expect(plusRes.body).toContain("1+1");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test 18: [...path] requires at least one segment ───────────────
+
+describe("catch-all [...path] requires at least one segment regression", () => {
+  it("should NOT match /docs for /docs/[...path] (requires at least one segment)", async () => {
+    const projectRoot = join(tempRoot, "catchall-required");
+    const appDir = join(projectRoot, "src", "app");
+    const docsCatchAllDir = join(appDir, "docs", "[...path]");
+
+    mkdirSync(docsCatchAllDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Catch-all docs page
+    writeFileSync(
+      join(docsCatchAllDir, "page.tsx"),
+      `export default function DocsPage({ params }: { params: { path: string } }) { return <div>Path:{params.path}</div>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // /docs without a segment should NOT match [...path]
+      const noSegmentRes = await fetchUrl(`${baseUrl}/docs`);
+      expect(noSegmentRes.status).toBe(404);
+
+      // /docs/getting-started should match (one segment)
+      const oneSegmentRes = await fetchUrl(`${baseUrl}/docs/getting-started`);
+      expect(oneSegmentRes.status).toBe(200);
+      expect(oneSegmentRes.body).toContain("getting-started");
+
+      // /docs/a/b/c should match (multi-segment)
+      const multiSegmentRes = await fetchUrl(`${baseUrl}/docs/a/b/c`);
+      expect(multiSegmentRes.status).toBe(200);
+      expect(multiSegmentRes.body).toContain("a/b/c");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
