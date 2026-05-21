@@ -804,13 +804,18 @@ function findDependents(sourcePath: string): Set<string> {
  * For component/utility files: same logic applies — all relative imports
  * are recursively transformed, so deep dependency chains are fully tracked.
  *
- * Circular import guard: the `visited` set tracks files currently being
- * processed in the call stack. If a circular import is detected (A → B → A),
- * the function returns the source file path directly instead of recursing,
- * breaking the cycle safely. The content-hash cascade still works because
- * the file is already being transformed by the caller.
+ * Circular import guard: the `stack` set tracks files currently being
+ * processed on the call stack. A path is added on entry and removed in a
+ * `finally` block on exit, so only files that are ancestors in the current
+ * recursion chain remain in the set. If a circular import is detected
+ * (A → B → A), the function returns the source file path directly instead
+ * of recursing, breaking the cycle safely. Shared dependencies are not
+ * affected because they are removed from the stack once finished:
+ *
+ *     page → A → Shared   (Shared removed after A finishes)
+ *     page → B → Shared   (Shared not in stack — processed normally)
  */
-function createServerModule(root: string, filePath: string, visited?: Set<string>) {
+function createServerModule(root: string, filePath: string, stack?: Set<string>) {
   const tmpDir = join(root, ".meiden", "server");
   mkdirSync(tmpDir, { recursive: true });
 
@@ -822,107 +827,117 @@ function createServerModule(root: string, filePath: string, visited?: Set<string
   // The source path is safe to use as an import specifier because
   // the file will already have been (or is being) transformed by
   // the caller — the content-hash cascade still works correctly.
-  if (!visited) visited = new Set();
-  if (visited.has(realPath)) {
+  //
+  // The stack behaves like a recursion stack, not a global visited set:
+  // paths are added on entry and removed in a `finally` block on exit.
+  // This avoids false positives for shared dependencies (A → Shared,
+  // B → Shared) where Shared would otherwise remain in the set after
+  // A finishes and be incorrectly treated as circular when B imports it.
+  if (!stack) stack = new Set();
+  if (stack.has(realPath)) {
     return realPath;
   }
-  visited.add(realPath);
+  stack.add(realPath);
 
-  const source = readFileSync(realPath, "utf8");
-  const imports = parseImports(realPath);
+  try {
+    const source = readFileSync(realPath, "utf8");
+    const imports = parseImports(realPath);
 
-  // Clear stale dependency edges for this file before re-registering.
-  // This handles the case where a hot-reloaded file removed an import
-  // — without clearing, the old edge would remain in the graph.
-  clearDependenciesOf(realPath);
+    // Clear stale dependency edges for this file before re-registering.
+    // This handles the case where a hot-reloaded file removed an import
+    // — without clearing, the old edge would remain in the graph.
+    clearDependenciesOf(realPath);
 
-  // Build replacements from end to start so offsets stay valid
-  const replacements: Array<{ start: number; end: number; text: string }> = [];
+    // Build replacements from end to start so offsets stay valid
+    const replacements: Array<{ start: number; end: number; text: string }> = [];
 
-  for (const imp of imports) {
-    const resolvedImport = resolveImport(realPath, imp.specifier);
+    for (const imp of imports) {
+      const resolvedImport = resolveImport(realPath, imp.specifier);
 
-    if (!resolvedImport) {
-      // For relative imports that can't be resolved, generate lazy stub
-      // bindings using Proxy that throw only when accessed (not at module
-      // evaluation time). This prevents `await import(...)` from crashing
-      // the dev server and gives a clear error message when the unresolved
-      // binding is actually used at runtime.
-      // Non-relative imports (node_modules, built-ins) are left as-is.
-      if (imp.specifier.startsWith(".")) {
-        // Side-effect imports (no bindings): just remove the statement
-        if (imp.localBindings.length === 0) {
-          replacements.push({ start: imp.start, end: imp.end, text: "" });
-          continue;
+      if (!resolvedImport) {
+        // For relative imports that can't be resolved, generate lazy stub
+        // bindings using Proxy that throw only when accessed (not at module
+        // evaluation time). This prevents `await import(...)` from crashing
+        // the dev server and gives a clear error message when the unresolved
+        // binding is actually used at runtime.
+        // Non-relative imports (node_modules, built-ins) are left as-is.
+        if (imp.specifier.startsWith(".")) {
+          // Side-effect imports (no bindings): just remove the statement
+          if (imp.localBindings.length === 0) {
+            replacements.push({ start: imp.start, end: imp.end, text: "" });
+            continue;
+          }
+
+          const safeSpecifier = escapeJsString(imp.specifier);
+          const safeFrom = escapeJsString(relative(root, realPath).replaceAll("\\", "/"));
+          const errMsg = `[meiden] Cannot resolve import ${safeSpecifier} from ${safeFrom}`;
+
+          // Generate a unique stub proxy variable for each binding.
+          // Use imp.start (byte offset of the import in the source) to avoid
+          // collisions when multiple broken imports exist in the same file.
+          const stubDecl = imp.localBindings.map((binding, i) => {
+            const stubVar = `__meiden_stub_${imp.start}_${i}`;
+            const localName = binding.localName;
+
+            // All stubs use a plain object target with toString/valueOf/
+            // Symbol.toPrimitive methods that throw. This ensures that:
+            //
+            //   <div>{Missing}</div>  → React calls Missing.toString() → throw → 500
+            //   <Missing />           → React sees typeof !== "function" → "Element type is invalid" → throw → 500
+            //   Missing.someProp      → Proxy get trap → throw → 500
+            //   Missing()             → TypeError: Missing is not a function → 500
+            //
+            // We deliberately do NOT use a function target because React SSR
+            // skips functions rendered as JSX children (just warns, returns 200).
+            // Using an object target forces React into the toString() path which
+            // our throwing methods intercept.
+            const throwTarget = `{\n  toString() { throw new Error("${errMsg}"); },\n  valueOf() { throw new Error("${errMsg}"); },\n  [Symbol.toPrimitive]() { throw new Error("${errMsg}"); },\n}`;
+
+            return `const ${stubVar} = new Proxy(${throwTarget}, { get: () => { throw new Error("${errMsg}"); } });\nconst ${localName} = ${stubVar};`;
+          }).join("\n");
+
+          replacements.push({ start: imp.start, end: imp.end, text: stubDecl });
         }
-
-        const safeSpecifier = escapeJsString(imp.specifier);
-        const safeFrom = escapeJsString(relative(root, realPath).replaceAll("\\", "/"));
-        const errMsg = `[meiden] Cannot resolve import ${safeSpecifier} from ${safeFrom}`;
-
-        // Generate a unique stub proxy variable for each binding.
-        // Use imp.start (byte offset of the import in the source) to avoid
-        // collisions when multiple broken imports exist in the same file.
-        const stubDecl = imp.localBindings.map((binding, i) => {
-          const stubVar = `__meiden_stub_${imp.start}_${i}`;
-          const localName = binding.localName;
-
-          // All stubs use a plain object target with toString/valueOf/
-          // Symbol.toPrimitive methods that throw. This ensures that:
-          //
-          //   <div>{Missing}</div>  → React calls Missing.toString() → throw → 500
-          //   <Missing />           → React sees typeof !== "function" → "Element type is invalid" → throw → 500
-          //   Missing.someProp      → Proxy get trap → throw → 500
-          //   Missing()             → TypeError: Missing is not a function → 500
-          //
-          // We deliberately do NOT use a function target because React SSR
-          // skips functions rendered as JSX children (just warns, returns 200).
-          // Using an object target forces React into the toString() path which
-          // our throwing methods intercept.
-          const throwTarget = `{\n  toString() { throw new Error("${errMsg}"); },\n  valueOf() { throw new Error("${errMsg}"); },\n  [Symbol.toPrimitive]() { throw new Error("${errMsg}"); },\n}`;
-
-          return `const ${stubVar} = new Proxy(${throwTarget}, { get: () => { throw new Error("${errMsg}"); } });\nconst ${localName} = ${stubVar};`;
-        }).join("\n");
-
-        replacements.push({ start: imp.start, end: imp.end, text: stubDecl });
+        continue;
       }
-      continue;
+
+      if (isClientModule(resolvedImport)) {
+        const proxyPath = createIslandProxy(root, resolvedImport, imp.importedNames);
+        // Replace just the specifier part of the import
+        const newStatement = imp.statement.replace(imp.specifier, proxyPath);
+        replacements.push({ start: imp.start, end: imp.end, text: newStatement });
+      } else if (imp.specifier.startsWith(".")) {
+        // Recursively transform relative non-client imports so that the
+        // entire import chain is content-hashed. When a component changes,
+        // its server module gets a new hash → the importing file's specifier
+        // changes → its server module also gets a new hash → Bun's import()
+        // loads fresh code instead of the cached version.
+        //
+        // Also register the dependency relationship so that the hot-reload
+        // watcher can find which pages need re-importing when this component
+        // changes.
+        registerDependency(realPath, resolvedImport);
+        const depServerPath = createServerModule(root, resolvedImport, stack);
+        const newStatement = imp.statement.replace(imp.specifier, depServerPath);
+        replacements.push({ start: imp.start, end: imp.end, text: newStatement });
+      } else {
+        // Non-relative imports (node_modules, built-ins): leave as-is
+      }
     }
 
-    if (isClientModule(resolvedImport)) {
-      const proxyPath = createIslandProxy(root, resolvedImport, imp.importedNames);
-      // Replace just the specifier part of the import
-      const newStatement = imp.statement.replace(imp.specifier, proxyPath);
-      replacements.push({ start: imp.start, end: imp.end, text: newStatement });
-    } else if (imp.specifier.startsWith(".")) {
-      // Recursively transform relative non-client imports so that the
-      // entire import chain is content-hashed. When a component changes,
-      // its server module gets a new hash → the importing file's specifier
-      // changes → its server module also gets a new hash → Bun's import()
-      // loads fresh code instead of the cached version.
-      //
-      // Also register the dependency relationship so that the hot-reload
-      // watcher can find which pages need re-importing when this component
-      // changes.
-      registerDependency(realPath, resolvedImport);
-      const depServerPath = createServerModule(root, resolvedImport, visited);
-      const newStatement = imp.statement.replace(imp.specifier, depServerPath);
-      replacements.push({ start: imp.start, end: imp.end, text: newStatement });
-    } else {
-      // Non-relative imports (node_modules, built-ins): leave as-is
+    // Apply replacements from end to start to preserve offsets
+    let result = source;
+    for (const rep of replacements.sort((a, b) => b.start - a.start)) {
+      result = result.slice(0, rep.start) + rep.text + result.slice(rep.end);
     }
-  }
 
-  // Apply replacements from end to start to preserve offsets
-  let result = source;
-  for (const rep of replacements.sort((a, b) => b.start - a.start)) {
-    result = result.slice(0, rep.start) + rep.text + result.slice(rep.end);
+    result = `import React from "react";\n${result}`;
+    const serverPath = join(tmpDir, `route-${hash(`${filePath}:${result}`)}.tsx`);
+    writeFileIfChanged(serverPath, result);
+    return serverPath;
+  } finally {
+    stack.delete(realPath);
   }
-
-  result = `import React from "react";\n${result}`;
-  const serverPath = join(tmpDir, `route-${hash(`${filePath}:${result}`)}.tsx`);
-  writeFileIfChanged(serverPath, result);
-  return serverPath;
 }
 
 // ─── Config Loading ────────────────────────────────────────────────

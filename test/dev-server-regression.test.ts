@@ -395,6 +395,65 @@ describe("circular import guard regression", () => {
   });
 });
 
+// ─── Test 8: Shared Dependency (not treated as circular) ─────────
+
+describe("shared dependency not treated as circular regression", () => {
+  it("should correctly handle shared dependencies: A→Shared, B→Shared should not be flagged as circular", async () => {
+    const projectRoot = join(tempRoot, "shared-dependency");
+    const appDir = join(projectRoot, "src", "app");
+    const componentsDir = join(appDir, "components");
+
+    mkdirSync(componentsDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Shared component (imported by both A and B)
+    writeFileSync(
+      join(componentsDir, "Shared.tsx"),
+      `export default function Shared() { return <span>Shared</span>; }`,
+    );
+
+    // Component A imports Shared
+    writeFileSync(
+      join(componentsDir, "A.tsx"),
+      `import Shared from "./Shared";\nexport default function A() { return <span>A<Shared /></span>; }`,
+    );
+
+    // Component B also imports Shared (not circular — just a shared dependency)
+    writeFileSync(
+      join(componentsDir, "B.tsx"),
+      `import Shared from "./Shared";\nexport default function B() { return <span>B<Shared /></span>; }`,
+    );
+
+    // Page imports both A and B
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `import A from "./components/A";\nimport B from "./components/B";\n\nexport default function Page() { return <div><A /><B /></div>; }`,
+    );
+
+    // The server should start without errors — Shared must not be
+    // treated as circular just because A and B both import it.
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      const res = await fetchUrl(`${baseUrl}/`);
+      expect(res.status).toBe(200);
+      expect(res.body).toContain("A");
+      expect(res.body).toContain("B");
+      expect(res.body).toContain("Shared");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 // ─── Test 6: Component Hot Reload ────────────────────────────────
 
 describe("component hot reload regression", () => {
