@@ -791,6 +791,23 @@ function findDependents(sourcePath: string): Set<string> {
 }
 
 /**
+ * Monotonically increasing counter incremented each time a top-level
+ * `createServerModule` call begins. Used as a transform generation ID
+ * in the deterministic cyclic path so that every HMR cascade produces
+ * fresh paths for ALL files — even those whose own source didn't change.
+ *
+ * Why not just hash the source? Consider A → B → A (cycle):
+ *   - Edit B only: A's source is unchanged → sourceHash is the same
+ *   - But A's transformed output DID change (A imports B's new path)
+ *   - Bun's ESM cache would return the old deterministic A module
+ *   - With a generation ID, A's path changes on every HMR cascade
+ *
+ * The generation is scoped to a single transform cascade: all recursive
+ * calls within the same top-level call share the same generation ID.
+ */
+let transformGeneration = 0;
+
+/**
  * Create a server-side version of a module by rewriting imports.
  *
  * For page/layout files: rewrites client component imports to island proxies,
@@ -815,31 +832,33 @@ function findDependents(sourcePath: string): Set<string> {
  *     page → A → Shared   (Shared removed after A finishes)
  *     page → B → Shared   (Shared not in stack — processed normally)
  *
- * In-progress module map: the `inProgress` map tracks the content-scoped
+ * In-progress module map: the `inProgress` map tracks the generation-scoped
  * server module path for each file currently being transformed. When a
  * circular import is detected, the cyclic reference uses this path
  * instead of the raw source path. This ensures that even cyclic
  * references point to a Meiden-transformed module (with `import React`,
  * rewritten island proxies, etc.) rather than the unprocessed source.
  *
- * Content-scoped versioning: the in-progress path includes a hash of the
- * raw source content (`route-${hash(realPath)}-${hash(source)}.tsx`).
- * This ensures the path changes across edits, which busts Bun's ESM
- * module cache. Without this, the path would be stable across edits and
- * Bun would return a cached (stale) module for cyclic references during
- * HMR:
+ * Generation-scoped versioning: the in-progress path includes a
+ * transform generation ID (`route-${hash(realPath)}-${transformId}.tsx`).
+ * This ensures the path changes for every HMR transform cascade, even
+ * if a particular file's own source didn't change. Without this, a
+ * file whose source was unchanged but whose transformed output changed
+ * (due to a dependency being edited) would keep the same deterministic
+ * path and Bun would return the cached (stale) module:
  *
  *     A → B → A (cycle)
- *     After editing A: sourceHash changes → new in-progress path
+ *     Edit B only: A's source unchanged, but A's transform DID change
+ *     → transformGeneration increments → new deterministic path for A
  *     → Bun loads fresh module instead of cached one
  *
  * The transformed content is written to both:
- *   1. The content-scoped path (for cyclic references — busts ESM cache)
+ *   1. The generation-scoped path (for cyclic references — busts ESM cache)
  *   2. The content-hashed path (for HMR cache-busting on the outer module)
  * The content-hashed path is returned from the outermost call so the
  * HMR cascade continues to work correctly.
  */
-function createServerModule(root: string, filePath: string, stack?: Set<string>, inProgress?: Map<string, string>) {
+function createServerModule(root: string, filePath: string, stack?: Set<string>, inProgress?: Map<string, string>, transformId?: number) {
   const tmpDir = join(root, ".meiden", "server");
   mkdirSync(tmpDir, { recursive: true });
 
@@ -858,8 +877,17 @@ function createServerModule(root: string, filePath: string, stack?: Set<string>,
   // This avoids false positives for shared dependencies (A → Shared,
   // B → Shared) where Shared would otherwise remain in the set after
   // A finishes and be incorrectly treated as circular when B imports it.
-  if (!stack) stack = new Set();
+  if (!stack) {
+    stack = new Set();
+    // Top-level call: increment the transform generation so that all
+    // deterministic cyclic paths in this cascade are fresh, even for
+    // files whose own source didn't change.
+    transformGeneration++;
+  }
   if (!inProgress) inProgress = new Map();
+  // Use the transform generation ID from the top-level call (or
+  // fall back to the current counter value for safety).
+  const generation = transformId ?? transformGeneration;
   if (stack.has(realPath)) {
     // Cycle detected — return the in-progress server module path
     // (or fall back to the raw source if not yet registered)
@@ -867,27 +895,23 @@ function createServerModule(root: string, filePath: string, stack?: Set<string>,
   }
   stack.add(realPath);
 
-  // Read source content early to compute a content-scoped hash for the
-  // deterministic path. Including the source hash ensures the cyclic
-  // reference path changes across edits, which busts Bun's ESM module
-  // cache. Without this, the path `route-${hash(realPath)}.tsx` would be
-  // stable across edits and Bun would return the cached (stale) module.
   const source = readFileSync(realPath, "utf8");
-  const sourceHash = hash(source);
 
-  // Pre-compute a content-scoped deterministic server module path and
-  // register it in the in-progress map before recursing into imports.
+  // Pre-compute a generation-scoped deterministic server module path
+  // and register it in the in-progress map before recursing into imports.
   // This allows cyclic references to find a valid server module path
   // even though the content-hashed path isn't known yet.
   //
-  // The path includes the source hash so that when a file is edited,
-  // the deterministic path changes and Bun's ESM cache is bypassed.
-  // This prevents stale cyclic references during HMR:
+  // The path includes the transform generation ID so that every HMR
+  // cascade produces fresh paths for ALL files, even those whose own
+  // source didn't change but whose transformed output did (because a
+  // dependency was edited). This prevents stale cyclic references:
   //
   //   A -> B -> A (cycle)
-  //   After editing A: sourceHash changes -> new deterministic path
-  //   -> Bun loads fresh module instead of cached one
-  const deterministicPath = join(tmpDir, `route-${hash(realPath)}-${sourceHash}.tsx`);
+  //   Edit B only: A's source unchanged, but transformGeneration
+  //   increments → A gets a new deterministic path → Bun loads
+  //   fresh module instead of the cached one
+  const deterministicPath = join(tmpDir, `route-${hash(realPath)}-${generation}.tsx`);
   inProgress.set(realPath, deterministicPath);
 
   try {
@@ -967,7 +991,7 @@ function createServerModule(root: string, filePath: string, stack?: Set<string>,
         // watcher can find which pages need re-importing when this component
         // changes.
         registerDependency(realPath, resolvedImport);
-        const depServerPath = createServerModule(root, resolvedImport, stack, inProgress);
+        const depServerPath = createServerModule(root, resolvedImport, stack, inProgress, generation);
         const newStatement = imp.statement.replace(imp.specifier, depServerPath);
         replacements.push({ start: imp.start, end: imp.end, text: newStatement });
       } else {
@@ -983,11 +1007,12 @@ function createServerModule(root: string, filePath: string, stack?: Set<string>,
 
     result = `import React from "react";\n${result}`;
 
-    // Write the transformed content to the content-scoped path.
+    // Write the transformed content to the generation-scoped path.
     // This path is used by cyclic references (B → A when A → B → A),
     // so it must contain the fully transformed module — not the raw
-    // source. Because the path includes the source hash, it changes
-    // across edits, busting Bun's ESM module cache for cyclic imports.
+    // source. Because the path includes the transform generation ID,
+    // it changes on every HMR cascade, busting Bun's ESM module cache
+    // for cyclic imports even when the file's own source didn't change.
     writeFileIfChanged(deterministicPath, result);
 
     // Also write to a content-hashed path for HMR cache-busting.
