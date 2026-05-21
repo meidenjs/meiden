@@ -65,6 +65,8 @@ interface MeidenConfig {
 interface AppModules {
   RootLayout: Component<{ children: unknown }>;
   routes: RouteManifestEntry[];
+  /** Nested layout components indexed by their file path */
+  nestedLayouts: Map<string, Component<{ children: unknown }>>;
 }
 
 interface AppRoute {
@@ -139,6 +141,14 @@ interface RouteManifestEntry {
   isDynamic: boolean;
   /** Loaded page component (undefined until loaded) */
   Page?: Component;
+  /**
+   * Ordered list of layout file paths from root to nearest route directory.
+   * For a page at app/blog/[slug]/page.tsx, this would be:
+   *   ["/abs/app/blog/[slug]/layout.tsx", "/abs/app/blog/layout.tsx"]
+   * (nearest first, root app/layout.tsx is NOT included — it's always
+   * the outermost wrapper and stored separately in RouteStore.RootLayout)
+   */
+  layouts: string[];
 }
 
 interface LayoutWrapperProps {
@@ -156,6 +166,7 @@ interface IslandReference {
 const moduleExtensions = [".tsx", ".ts", ".jsx", ".js"];
 const configExtensions = [".ts", ".js", ".mjs", ".mts", ".cjs"];
 const routeFilePattern = /(^|\/)page\.(tsx|ts|jsx|js)$/;
+const layoutFilePattern = /(^|\/)layout\.(tsx|ts|jsx|js)$/;
 
 const reactHooks = new Set([
   "useState",
@@ -1198,6 +1209,7 @@ function buildRouteManifestEntry(appDir: string, filePath: string): RouteManifes
   const routeDir = relativePath.replace(routeFilePattern, "");
 
   // Root page: app/page.tsx → "/"
+  // No nested layouts possible for the root page
   if (!routeDir) {
     return {
       kind: "page",
@@ -1207,6 +1219,7 @@ function buildRouteManifestEntry(appDir: string, filePath: string): RouteManifes
       params: [],
       filePath,
       isDynamic: false,
+      layouts: [],
     };
   }
 
@@ -1244,6 +1257,12 @@ function buildRouteManifestEntry(appDir: string, filePath: string): RouteManifes
 
   const isDynamic = segments.some(s => s.kind !== "static");
 
+  // Resolve the nested layout chain for this page.
+  // Returns paths ordered from nearest (innermost) to outermost,
+  // excluding the root app/layout.tsx which is always the outermost
+  // wrapper and stored separately in RouteStore.RootLayout.
+  const layouts = resolveLayoutChain(appDir, filePath);
+
   return {
     kind: "page",
     path,
@@ -1252,6 +1271,7 @@ function buildRouteManifestEntry(appDir: string, filePath: string): RouteManifes
     params,
     filePath,
     isDynamic,
+    layouts,
   };
 }
 
@@ -1399,6 +1419,93 @@ function scanAppRoutes(appDir: string) {
   return routes;
 }
 
+/**
+ * Scan the app directory for all layout.tsx files (excluding the root layout).
+ * Returns an array of absolute file paths.
+ *
+ * The root layout (app/layout.tsx) is NOT included because it is always
+ * required and handled separately as RouteStore.RootLayout. Only nested
+ * layouts (app/blog/layout.tsx, etc.) are returned here.
+ */
+function scanAppLayouts(appDir: string): string[] {
+  const layouts: string[] = [];
+
+  function walk(dir: string) {
+    for (const entry of readdirSync(dir)) {
+      const fullPath = join(dir, entry);
+      const stats = statSync(fullPath);
+
+      if (stats.isDirectory()) {
+        walk(fullPath);
+        continue;
+      }
+
+      if (layoutFilePattern.test(fullPath)) {
+        // Skip root layout — it's handled separately
+        if (fullPath === join(appDir, "layout.tsx") ||
+            fullPath === join(appDir, "layout.ts") ||
+            fullPath === join(appDir, "layout.jsx") ||
+            fullPath === join(appDir, "layout.js")) {
+          continue;
+        }
+        layouts.push(fullPath);
+      }
+    }
+  }
+
+  walk(appDir);
+  return layouts;
+}
+
+/**
+ * Resolve the layout chain for a page route. Returns an array of layout
+ * file paths ordered from nearest to the page (innermost) to the root
+ * app directory (outermost, but NOT including the root layout itself).
+ *
+ * For a page at app/blog/[slug]/page.tsx, this returns:
+ *   ["/abs/app/blog/[slug]/layout.tsx", "/abs/app/blog/layout.tsx"]
+ * (if both exist)
+ *
+ * For a page at app/about/page.tsx, this returns:
+ *   ["/abs/app/about/layout.tsx"]
+ * (if it exists, otherwise [])
+ *
+ * For the root page at app/page.tsx, this returns [] (no nested layouts).
+ *
+ * The root layout (app/layout.tsx) is NOT included in this chain because
+ * it is always the outermost wrapper and stored separately in
+ * RouteStore.RootLayout.
+ */
+function resolveLayoutChain(appDir: string, pageFilePath: string): string[] {
+  const relativePath = pageFilePath.slice(appDir.length + 1);
+  const routeDir = relativePath.replace(routeFilePattern, "");
+
+  // Root page has no nested layouts
+  if (!routeDir) return [];
+
+  // Walk from the page's directory up to appDir, collecting layout files.
+  // At each level, check if a layout file exists (it's optional).
+  // The loop stops before reaching appDir itself, so the root layout
+  // (app/layout.tsx) is never included — it's stored separately in
+  // RouteStore.RootLayout.
+  const layouts: string[] = [];
+  let currentDir = join(appDir, routeDir);
+
+  while (currentDir !== appDir && currentDir.startsWith(appDir)) {
+    // Check for layout file at this level (without throwing if not found)
+    for (const extension of moduleExtensions) {
+      const candidate = join(currentDir, `layout${extension}`);
+      if (existsSync(candidate)) {
+        layouts.push(candidate);
+        break; // Found a layout at this level, move up
+      }
+    }
+    currentDir = dirname(currentDir);
+  }
+
+  return layouts;
+}
+
 async function loadLegacyModules(root: string): Promise<AppModules> {
   const srcDir = join(root, "src");
   const layoutModule = await import(resolveAppModule(srcDir, "layout"));
@@ -1410,7 +1517,8 @@ async function loadLegacyModules(root: string): Promise<AppModules> {
 
   return {
     RootLayout: layoutModule.default,
-    routes: [{ path: "/", Page: indexModule.default, filePath: "src/index" }],
+    routes: [{ path: "/", Page: indexModule.default, filePath: "src/index", layouts: [] }],
+    nestedLayouts: new Map(),
   };
 }
 
@@ -1480,9 +1588,41 @@ async function loadAppModules(root: string, config: MeidenConfig): Promise<AppMo
     }),
   );
 
+  // Load nested layout modules. Each layout is loaded in isolation —
+  // a broken layout only affects routes that use it, not the whole server.
+  // Failed layouts get a throwing component that triggers 500 for the
+  // affected routes.
+  const layoutFilePaths = scanAppLayouts(appDir);
+  const nestedLayouts = new Map<string, Component<{ children: unknown }>>();
+
+  await Promise.all(
+    layoutFilePaths.map(async (layoutPath) => {
+      try {
+        const layoutModule = await import(pathToFileURL(createServerModule(root, layoutPath)).href);
+
+        if (!layoutModule.default) {
+          console.warn(`[meiden] Nested layout has no default export: ${layoutPath}`);
+          nestedLayouts.set(layoutPath, () => {
+            throw new Error(`Layout missing default export: ${layoutPath}`);
+          });
+          return;
+        }
+
+        nestedLayouts.set(layoutPath, layoutModule.default);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[meiden] Failed to load nested layout ${layoutPath}: ${message}`);
+        nestedLayouts.set(layoutPath, () => {
+          throw new Error(`Failed to load layout: ${message}`);
+        });
+      }
+    }),
+  );
+
   return {
     RootLayout: layoutModule.default,
     routes,
+    nestedLayouts,
   };
 }
 
@@ -1699,9 +1839,45 @@ async function buildIslandModule(root: string, source: string, exportName: strin
 
 // ─── Layout & Route Rendering ──────────────────────────────────────
 
-export function createLayoutWrapper(RootLayout: AppModules["RootLayout"]) {
+/**
+ * Create a layout wrapper that renders the full layout chain:
+ *
+ *   RootLayout > NestedLayoutN > ... > NestedLayout1 > Page
+ *
+ * The root layout is always the outermost wrapper. Nested layouts are
+ * applied in reverse order of entry.layouts (which is nearest-first),
+ * so the outermost nested layout (closest to root) wraps first, and
+ * the innermost nested layout (closest to the page) wraps last.
+ *
+ * If a nested layout component is missing from nestedLayouts (e.g.
+ * because it failed to load), a throwing placeholder is used that
+ * triggers a 500 for routes that depend on it — but NOT for routes
+ * that don't use this layout.
+ */
+export function createLayoutWrapper(
+  RootLayout: AppModules["RootLayout"],
+  layoutChain: string[],
+  nestedLayouts: Map<string, Component<{ children: unknown }>>,
+) {
   return function LayoutWrapper({ Page, params }: LayoutWrapperProps): any {
-    return <RootLayout><Page params={params} /></RootLayout>;
+    // Start with the page component, then wrap with layouts from
+    // innermost (nearest to page) to outermost (nearest to root).
+    // entry.layouts is ordered nearest-first, so we iterate in order.
+    let element: any = <Page params={params} />;
+
+    for (const layoutPath of layoutChain) {
+      const LayoutComponent = nestedLayouts.get(layoutPath);
+      if (LayoutComponent) {
+        element = <LayoutComponent>{element}</LayoutComponent>;
+      } else {
+        // Layout file was listed but not loaded — this shouldn't
+        // normally happen, but if it does, use a throwing placeholder
+        element = (() => { throw new Error(`Layout not loaded: ${layoutPath}`); })();
+      }
+    }
+
+    // Root layout is always the outermost wrapper
+    return <RootLayout>{element}</RootLayout>;
   };
 }
 
@@ -1794,8 +1970,7 @@ export async function buildApp({
   const projectRoot = resolve(root);
   const outputRoot = resolve(projectRoot, outDir);
   const config = await loadConfig(projectRoot);
-  const { RootLayout, routes } = await loadAppModules(projectRoot, config);
-  const LayoutWrapper = createLayoutWrapper(RootLayout);
+  const { RootLayout, routes, nestedLayouts } = await loadAppModules(projectRoot, config);
   const rendered = new Map<AppRoute, string>();
   const islands = new Map<string, IslandReference>();
   const assets: BuildResult["assets"] = [];
@@ -1805,6 +1980,7 @@ export async function buildApp({
   copyPublicDir(join(projectRoot, "public"), outputRoot);
 
   for (const route of routes) {
+    const LayoutWrapper = createLayoutWrapper(RootLayout, route.layouts, nestedLayouts);
     const html = await renderRoute(projectRoot, LayoutWrapper, route);
     rendered.set(route, html);
 
@@ -2083,6 +2259,14 @@ interface RouteStore {
   dynamicRoutes: RouteManifestEntry[];
   /** All routes indexed by filePath for hot reload lookups */
   routesByFilePath: Map<string, RouteManifestEntry>;
+  /**
+   * Nested layout components indexed by their file path.
+   * When a nested layout is hot-reloaded, only the component in this
+   * map is updated — all routes that reference this layout file path
+   * in their entry.layouts array will automatically use the new version
+   * on the next request because rendering reads from this map.
+   */
+  nestedLayouts: Map<string, Component<{ children: unknown }>>;
 }
 
 /**
@@ -2130,10 +2314,10 @@ async function hotReloadPage(
 }
 
 /**
- * Hot-reload the layout module. Regenerates the server module,
+ * Hot-reload the root layout module. Regenerates the server module,
  * re-imports it, and updates the route store's RootLayout.
  */
-async function hotReloadLayout(
+async function hotReloadRootLayout(
   projectRoot: string,
   config: MeidenConfig,
   routeStore: RouteStore,
@@ -2146,15 +2330,55 @@ async function hotReloadLayout(
     );
 
     if (!layoutModule.default) {
-      console.error("[meiden] Hot reload: layout has no default export — keeping old layout");
+      console.error("[meiden] Hot reload: root layout has no default export — keeping old layout");
       return;
     }
 
     routeStore.RootLayout = layoutModule.default;
-    console.log("[meiden] Hot reload: layout");
+    console.log("[meiden] Hot reload: root layout");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`[meiden] Hot reload failed for layout: ${message}`);
+    console.error(`[meiden] Hot reload failed for root layout: ${message}`);
+  }
+}
+
+/**
+ * Hot-reload a nested layout module. Regenerates the server module,
+ * re-imports it, and updates the component in routeStore.nestedLayouts.
+ *
+ * Only routes that reference this layout in their entry.layouts array
+ * are affected. Other routes continue to use their existing (cached)
+ * layout components and are not impacted.
+ */
+async function hotReloadNestedLayout(
+  projectRoot: string,
+  routeStore: RouteStore,
+  layoutFilePath: string,
+) {
+  try {
+    const layoutModule = await import(
+      pathToFileURL(createServerModule(projectRoot, layoutFilePath)).href
+    );
+
+    if (!layoutModule.default) {
+      console.error(`[meiden] Hot reload: nested layout has no default export: ${layoutFilePath}`);
+      // Set a throwing placeholder so affected routes get 500
+      routeStore.nestedLayouts.set(layoutFilePath, () => {
+        throw new Error(`Layout missing default export: ${layoutFilePath}`);
+      });
+      return;
+    }
+
+    routeStore.nestedLayouts.set(layoutFilePath, layoutModule.default);
+    console.log(`[meiden] Hot reload: nested layout ${layoutFilePath}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[meiden] Hot reload failed for nested layout ${layoutFilePath}: ${message}`);
+    // Set a throwing placeholder so affected routes get 500 instead
+    // of using stale code
+    routeStore.nestedLayouts.set(layoutFilePath, () => {
+      throw new Error(`Failed to load layout: ${message}`);
+    });
   }
 }
 
@@ -2187,13 +2411,18 @@ async function hotReloadComponent(
     return;
   }
 
-  const layoutPattern = /(^|\/)layout\.(tsx|ts|jsx|js)$/;
-
   for (const depPath of dependents) {
     if (!existsSync(depPath)) continue;
 
-    if (layoutPattern.test(depPath)) {
-      await hotReloadLayout(projectRoot, config, routeStore);
+    if (layoutFilePattern.test(depPath)) {
+      // Determine if this is the root layout or a nested layout
+      const appDir = resolveAppDir(projectRoot, config);
+      const rootLayoutPath = toPath(resolveAppModule(appDir, "layout"));
+      if (depPath === rootLayoutPath) {
+        await hotReloadRootLayout(projectRoot, config, routeStore);
+      } else {
+        await hotReloadNestedLayout(projectRoot, routeStore, depPath);
+      }
     } else if (routeFilePattern.test(depPath)) {
       await hotReloadPage(projectRoot, config, routeStore, depPath);
     }
@@ -2216,7 +2445,7 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
   }
 
   const config = await loadConfig(projectRoot);
-  const { RootLayout, routes: initialRoutes } = await loadAppModules(projectRoot, config);
+  const { RootLayout, routes: initialRoutes, nestedLayouts: initialNestedLayouts } = await loadAppModules(projectRoot, config);
 
   // Mutable route store — hot reload updates this in-place.
   // Route handlers read from this store instead of closing over
@@ -2244,6 +2473,7 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
     staticRoutes,
     dynamicRoutes,
     routesByFilePath,
+    nestedLayouts: initialNestedLayouts,
   };
 
   const publicDir = join(projectRoot, "public");
@@ -2322,10 +2552,15 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
       const routePath = entry.path;
 
       try {
-        // Create a fresh LayoutWrapper each request using the current RootLayout
-        // from the mutable store. This ensures hot-reloaded layouts take effect
-        // immediately without restarting the server.
-        const CurrentLayoutWrapper = createLayoutWrapper(routeStore.RootLayout);
+        // Create a fresh LayoutWrapper each request using the current
+        // RootLayout and nested layout components from the mutable store.
+        // This ensures hot-reloaded layouts take effect immediately
+        // without restarting the server.
+        const CurrentLayoutWrapper = createLayoutWrapper(
+          routeStore.RootLayout,
+          entry.layouts,
+          routeStore.nestedLayouts,
+        );
 
         // Pass params as props to the Page component for dynamic routes.
         // Static routes receive an empty params object.
@@ -2404,8 +2639,6 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
     let reloadTimer: ReturnType<typeof setTimeout> | null = null;
     const changedFiles = new Set<string>();
 
-    const layoutPattern = /(^|\/)layout\.(tsx|ts|jsx|js)$/;
-
     const watcher = watch(appDir, { recursive: true }, (event, filename) => {
       if (!filename) return;
 
@@ -2433,11 +2666,17 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
             continue;
           }
 
-          const isLayoutFile = layoutPattern.test(file);
+          const isLayoutFile = layoutFilePattern.test(file);
           const isPageFile = routeFilePattern.test(file);
 
           if (isLayoutFile) {
-            await hotReloadLayout(projectRoot, config, routeStore);
+            // Determine if this is the root layout or a nested layout
+            const rootLayoutPath = toPath(resolveAppModule(appDir, "layout"));
+            if (file === rootLayoutPath) {
+              await hotReloadRootLayout(projectRoot, config, routeStore);
+            } else {
+              await hotReloadNestedLayout(projectRoot, routeStore, file);
+            }
           } else if (isPageFile) {
             await hotReloadPage(projectRoot, config, routeStore, file);
           } else {
