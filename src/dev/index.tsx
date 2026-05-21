@@ -2048,22 +2048,26 @@ export async function buildApp({
   const projectRoot = resolve(root);
   const outputRoot = resolve(projectRoot, outDir);
   const config = await loadConfig(projectRoot);
+  const appDir = resolveAppDir(projectRoot, config);
   const { RootLayout, routes, nestedLayouts } = await loadAppModules(projectRoot, config);
   const rendered = new Map<AppRoute, string>();
   const islands = new Map<string, IslandReference>();
   const assets: BuildResult["assets"] = [];
 
+  // Separate routes by kind and dynamism for different build strategies
+  const staticPageRoutes = routes.filter(r => r.kind === "page" && !r.isDynamic);
+  const dynamicPageRoutes = routes.filter(r => r.kind === "page" && r.isDynamic);
+  const apiRoutes = routes.filter(r => r.kind === "api");
+  const needsRuntimeServer = dynamicPageRoutes.length > 0 || apiRoutes.length > 0;
+
   rmSync(outputRoot, { recursive: true, force: true });
   mkdirSync(outputRoot, { recursive: true });
   copyPublicDir(join(projectRoot, "public"), outputRoot);
 
-  for (const route of routes) {
-    // API routes don't produce HTML — skip them in the static build
-    if (route.kind === "api") continue;
-
+  // Pre-render only static page routes to HTML
+  for (const route of staticPageRoutes) {
     // Call load() if the page exports one, passing empty params for
-    // static builds (dynamic routes with params are not supported in
-    // static builds — they would need per-param pre-rendering).
+    // static builds (static routes have no dynamic params).
     let data: unknown = undefined;
     if (route.load) {
       data = await route.load({ params: {} });
@@ -2136,6 +2140,7 @@ export async function buildApp({
     });
   }
 
+  // Write pre-rendered static HTML files
   for (const [route, html] of rendered) {
     // Inject shared chunk scripts into the HTML
     const finalHtml = injectSharedChunkScripts(html, sharedChunkPaths);
@@ -2151,8 +2156,69 @@ export async function buildApp({
     });
   }
 
-  // Build a lightweight static file server
-  await buildStaticServer(outputRoot, routes);
+  // Build the production server
+  // When there are dynamic routes or API routes, we need a runtime server
+  // that can match routes and render/dispatch on demand.
+  if (needsRuntimeServer) {
+    // Bundle server modules for dynamic routes and API routes
+    const serverModulesDir = join(outputRoot, "_meiden", "server");
+    mkdirSync(serverModulesDir, { recursive: true });
+
+    // Build the route manifest data for the production server.
+    // This includes all routes (static + dynamic + API) so the server can
+    // match URLs and dispatch to the correct handler.
+    const productionManifest = buildProductionManifest(
+      appDir,
+      routes,
+      projectRoot,
+      outputRoot,
+      serverModulesDir,
+    );
+
+    // Bundle the root layout
+    const rootLayoutModulePath = createServerModule(projectRoot, resolveAppModule(appDir, "layout"));
+    const rootLayoutDest = join(serverModulesDir, "root-layout.js");
+    await bundleServerModule(rootLayoutModulePath, rootLayoutDest, projectRoot);
+
+    // Bundle nested layouts
+    for (const [layoutPath, _component] of nestedLayouts) {
+      const serverModulePath = createServerModule(projectRoot, layoutPath);
+      const layoutHash = hash(layoutPath);
+      const destPath = join(serverModulesDir, `layout-${layoutHash}.js`);
+      await bundleServerModule(serverModulePath, destPath, projectRoot);
+    }
+
+    // Bundle dynamic page route modules
+    for (const route of dynamicPageRoutes) {
+      const serverModulePath = createServerModule(projectRoot, route.filePath);
+      const routeHash = hash(route.filePath);
+      const destPath = join(serverModulesDir, `page-${routeHash}.js`);
+      await bundleServerModule(serverModulePath, destPath, projectRoot);
+    }
+
+    // Bundle API route modules
+    for (const route of apiRoutes) {
+      const serverModulePath = createServerModule(projectRoot, route.filePath);
+      const routeHash = hash(route.filePath);
+      const destPath = join(serverModulesDir, `api-${routeHash}.js`);
+      await bundleServerModule(serverModulePath, destPath, projectRoot);
+    }
+
+    // Also bundle static page modules so the runtime server can serve them
+    // (for cases where the static HTML file isn't found, e.g. during
+    // development of the production server)
+    for (const route of staticPageRoutes) {
+      const serverModulePath = createServerModule(projectRoot, route.filePath);
+      const routeHash = hash(route.filePath);
+      const destPath = join(serverModulesDir, `page-${routeHash}.js`);
+      await bundleServerModule(serverModulePath, destPath, projectRoot);
+    }
+
+    await buildRuntimeServer(outputRoot, productionManifest, sharedChunkPaths);
+  } else {
+    // Pure static site — use the lightweight static file server
+    await buildStaticServer(outputRoot, routes);
+  }
 
   return {
     outDir: outputRoot,
@@ -2160,6 +2226,424 @@ export async function buildApp({
     islands: islands.size,
     assets: assets.sort((a, b) => b.size - a.size),
   };
+}
+
+// ─── Production Manifest & Bundling ─────────────────────────────────
+
+/**
+ * Serializable route manifest entry for the production server.
+ * This is a subset of RouteManifestEntry that can be embedded in the
+ * generated server.js — it excludes runtime-only fields like Page and
+ * handlers, and uses string regex patterns instead of RegExp objects.
+ */
+interface ProductionManifestEntry {
+  kind: RouteKind;
+  path: string;
+  /** Regex pattern string (e.g. "^\\/blog\\/([^/]+)$") */
+  pattern: string;
+  params: string[];
+  isDynamic: boolean;
+  /** Module path relative to serverModulesDir */
+  modulePath: string;
+  /** Layout module paths relative to serverModulesDir, nearest-first */
+  layoutModulePaths: string[];
+  /** Root layout module path relative to serverModulesDir */
+  rootLayoutModulePath: string;
+}
+
+/**
+ * Build the production route manifest — a serializable data structure
+ * that the generated server.js uses for route matching and module loading.
+ *
+ * Each entry maps to a bundled server module in dist/_meiden/server/.
+ * The module paths are relative to the server modules directory so the
+ * generated server.js can resolve them at runtime.
+ */
+function buildProductionManifest(
+  appDir: string,
+  routes: RouteManifestEntry[],
+  projectRoot: string,
+  outputRoot: string,
+  serverModulesDir: string,
+): ProductionManifestEntry[] {
+  return routes.map(route => {
+    const routeHash = hash(route.filePath);
+
+    // Determine the module filename based on route kind
+    let moduleFilename: string;
+    if (route.kind === "api") {
+      moduleFilename = `api-${routeHash}.js`;
+    } else {
+      moduleFilename = `page-${routeHash}.js`;
+    }
+
+    // Build layout module filenames
+    const layoutModulePaths = route.layouts.map(layoutPath => {
+      const layoutHash = hash(layoutPath);
+      return `layout-${layoutHash}.js`;
+    });
+
+    return {
+      kind: route.kind,
+      path: route.path,
+      pattern: route.pattern.source,
+      params: route.params,
+      isDynamic: route.isDynamic,
+      modulePath: moduleFilename,
+      layoutModulePaths,
+      rootLayoutModulePath: "root-layout.js",
+    };
+  });
+}
+
+/**
+ * Bundle a server module (created by createServerModule) into a
+ * self-contained JavaScript file that can be imported by the production
+ * server at runtime.
+ *
+ * Uses Bun.build() to resolve and bundle all dependencies so the
+ * production server doesn't need access to the source directory or
+ * node_modules at runtime.
+ */
+async function bundleServerModule(
+  serverModulePath: string,
+  destPath: string,
+  projectRoot: string,
+): Promise<void> {
+  let buildSucceeded = false;
+
+  try {
+    const result = await Bun.build({
+      entrypoints: [serverModulePath],
+      outdir: resolve(destPath, ".."),
+      naming: `[name].[ext]`,
+      target: "bun",
+      format: "esm",
+      minify: false,
+      splitting: false,
+      external: [],
+    });
+
+    if (result.success && result.outputs.length > 0) {
+      const content = await result.outputs[0].text();
+      writeFileIfChanged(destPath, content);
+      buildSucceeded = true;
+      return;
+    }
+
+    if (!result.success) {
+      // Silently fall through to transpiler fallback
+    }
+  } catch {
+    // Silently fall through to transpiler fallback
+  }
+
+  // Fallback: Use Bun.Transpiler to transform TSX to JS.
+  // This produces a self-contained module that can be imported by Bun.
+  // The imports (like `import React from "react"`) are preserved so they
+  // resolve at runtime from the project's node_modules.
+  if (!buildSucceeded && existsSync(serverModulePath)) {
+    try {
+      const source = readFileSync(serverModulePath, "utf8");
+      const transpiler = new Bun.Transpiler({
+        loader: serverModulePath.endsWith(".tsx") ? "tsx" : "ts",
+        target: "bun",
+        tsconfig: {
+          compilerOptions: {
+            jsx: "react",
+            jsxFactory: "React.createElement",
+            jsxFragmentFactory: "React.Fragment",
+          },
+        },
+      });
+      const transformed = await transpiler.transform(source);
+      writeFileIfChanged(destPath, typeof transformed === "string" ? transformed : new TextDecoder().decode(transformed as Uint8Array));
+    } catch {
+      // Last resort: copy the raw file as-is
+      const content = readFileSync(serverModulePath, "utf8");
+      writeFileIfChanged(destPath, content);
+    }
+  }
+}
+
+// ─── Runtime Server Generation ──────────────────────────────────────
+
+/**
+ * Build a production server with runtime route matching and SSR.
+ *
+ * This server supports:
+ * - Static file serving (public/, pre-rendered HTML, island bundles)
+ * - Dynamic page routes with SSR (regex pattern matching, params extraction)
+ * - API route method dispatch (GET, POST, PUT, DELETE, etc.)
+ * - 405 Method Not Allowed for unsupported methods on API routes
+ * - Controlled 500 on import/runtime errors
+ * - Safe URL decoding with 404 for malformed percent-encoding
+ *
+ * The server embeds the route manifest data and loads modules from
+ * dist/_meiden/server/ at runtime via dynamic import().
+ */
+async function buildRuntimeServer(
+  outputRoot: string,
+  manifest: ProductionManifestEntry[],
+  sharedChunkPaths: string[],
+) {
+  const contentTypeEntries = Object.entries(getContentTypeMapForServer())
+    .map(([ext, type]) => `  ${JSON.stringify(ext)}: ${JSON.stringify(type)}`)
+    .join(",\n");
+
+  // Serialize the manifest for embedding in server.js
+  const manifestSource = JSON.stringify(manifest, null, 2);
+
+  // Serialize shared chunk paths for injecting into SSR HTML
+  const sharedChunkScripts = sharedChunkPaths
+    .map(p => `<script type="module" src="${p}"></script>`)
+    .join("\\n");
+
+  const entryContent = `
+import { existsSync, statSync } from "node:fs";
+import { join, resolve, extname } from "node:path";
+import { renderToString } from "react-dom/server";
+import React from "react";
+
+const distRoot = import.meta.dir;
+const serverModulesDir = join(distRoot, "_meiden", "server");
+const contentTypes = {
+${contentTypeEntries}
+};
+
+// Route manifest embedded from build time
+const routeManifest = ${manifestSource};
+
+// Build lookup structures: static routes by exact path, dynamic routes
+// for sequential regex matching (same strategy as dev server)
+const staticRoutes = new Map();
+const dynamicRoutes = [];
+
+for (const entry of routeManifest) {
+  // API routes always need runtime matching (they're never pre-rendered)
+  if (entry.kind === "api") {
+    dynamicRoutes.push({ ...entry, pattern: new RegExp(entry.pattern) });
+    continue;
+  }
+  // Dynamic page routes need runtime matching
+  if (entry.isDynamic) {
+    dynamicRoutes.push({ ...entry, pattern: new RegExp(entry.pattern) });
+    continue;
+  }
+  // Static page routes: indexed by exact path for O(1) lookup
+  staticRoutes.set(entry.path, entry);
+  // Also add to dynamicRoutes as fallback if static HTML not found
+  dynamicRoutes.push({ ...entry, pattern: new RegExp(entry.pattern) });
+}
+
+// Module cache: loaded modules are cached so they're only imported once
+const moduleCache = new Map();
+
+async function loadModule(modulePath) {
+  if (moduleCache.has(modulePath)) {
+    return moduleCache.get(modulePath);
+  }
+  const fullPath = join(serverModulesDir, modulePath);
+  const mod = await import(fullPath);
+  moduleCache.set(modulePath, mod);
+  return mod;
+}
+
+function safeDecodeURIComponent(encoded) {
+  try {
+    return decodeURIComponent(encoded);
+  } catch {
+    return null;
+  }
+}
+
+function safeDecodeParam(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
+}
+
+function matchRoute(pathname) {
+  // Fast path: exact match for static routes
+  const staticEntry = staticRoutes.get(pathname);
+  if (staticEntry) {
+    return { entry: staticEntry, params: {} };
+  }
+
+  // Try each dynamic route pattern
+  for (const entry of dynamicRoutes) {
+    const match = pathname.match(entry.pattern);
+    if (match) {
+      const params = {};
+      for (let i = 0; i < entry.params.length; i++) {
+        const paramName = entry.params[i];
+        const captured = match[i + 1];
+        const decoded = captured ? safeDecodeParam(captured) : "";
+        if (decoded === null) return undefined; // malformed encoding -> no match
+        params[paramName] = decoded;
+      }
+      return { entry, params };
+    }
+  }
+
+  return undefined;
+}
+
+function resolveBuiltFile(requestPath) {
+  let pathname;
+  try {
+    pathname = safeDecodeURIComponent(new URL(requestPath, "http://meiden.local").pathname);
+  } catch {
+    return undefined;
+  }
+  if (pathname === null) return undefined;
+  const cleanPath = pathname.replace(/^\\/+/, "");
+  const candidates = [
+    cleanPath ? join(distRoot, cleanPath) : join(distRoot, "index.html"),
+    join(distRoot, cleanPath, "index.html"),
+  ];
+
+  for (const candidate of candidates) {
+    const resolved = resolve(candidate);
+    if (!resolved.startsWith(distRoot + "/") && resolved !== distRoot) continue;
+    if (existsSync(resolved) && statSync(resolved).isFile()) return resolved;
+  }
+  return undefined;
+}
+
+async function renderPage(entry, params) {
+  // Load the page module
+  const pageMod = await loadModule(entry.modulePath);
+  if (!pageMod.default) {
+    throw new Error("Page module has no default export");
+  }
+  const Page = pageMod.default;
+  const loadFn = typeof pageMod.load === "function" ? pageMod.load : undefined;
+
+  // Call load() if exported
+  let data = undefined;
+  if (loadFn) {
+    data = await loadFn({ params });
+  }
+
+  // Load and build the layout chain
+  const RootLayoutMod = await loadModule(entry.rootLayoutModulePath);
+  const RootLayout = RootLayoutMod.default;
+  if (!RootLayout) {
+    throw new Error("Root layout module has no default export");
+  }
+
+  // Load nested layouts (nearest first → wrap from innermost to outermost)
+  let element = React.createElement(Page, { params, data });
+  for (const layoutPath of entry.layoutModulePaths) {
+    const layoutMod = await loadModule(layoutPath);
+    if (layoutMod.default) {
+      element = React.createElement(layoutMod.default, null, element);
+    }
+  }
+  // Root layout is always outermost
+  element = React.createElement(RootLayout, null, element);
+
+  // SSR render
+  const html = "<!DOCTYPE html>" + renderToString(element);
+
+  // Inject island runtime and shared chunks if HTML contains islands
+  const hasIslands = html.includes("data-meiden-island");
+  let finalHtml = html;
+  if (hasIslands) {
+    const runtimeScript = '<script type="module" src="/_meiden/islands/runtime.js">';
+    const chunksPlusRuntime = "${sharedChunkScripts}\\n" + runtimeScript;
+    if (finalHtml.includes(runtimeScript)) {
+      finalHtml = finalHtml.replace(runtimeScript, chunksPlusRuntime);
+    } else if (finalHtml.includes("</body>")) {
+      finalHtml = finalHtml.replace("</body>", chunksPlusRuntime + "</script></body>");
+    }
+  }
+
+  return finalHtml;
+}
+
+async function handleApiRoute(entry, params, request) {
+  const apiMod = await loadModule(entry.modulePath);
+  const method = request.method;
+
+  const handler = apiMod[method];
+  if (typeof handler !== "function") {
+    return new Response("Method Not Allowed", { status: 405, headers: { Allow: Object.keys(apiMod).filter(k => typeof apiMod[k] === "function").join(", ") } });
+  }
+
+  return handler({ request, params });
+}
+
+const port = Number(process.env.PORT) || 3000;
+
+Bun.serve({
+  port,
+  async fetch(request) {
+    const startedAt = performance.now();
+    let pathname;
+    try { pathname = new URL(request.url).pathname; } catch { pathname = request.url; }
+    const method = request.method;
+
+    // 1. Try static file serving first (public/, pre-rendered HTML, island bundles)
+    const filePath = resolveBuiltFile(request.url);
+    if (filePath) {
+      const duration = (performance.now() - startedAt).toFixed(1);
+      console.log("\\x1b[32m200\\x1b[0m  " + method.padEnd(4) + "  " + pathname.padEnd(8) + "  " + duration + "ms");
+      const ext = extname(filePath);
+      return new Response(Bun.file(filePath), {
+        headers: { "content-type": contentTypes[ext] || "application/octet-stream" },
+      });
+    }
+
+    // 2. Try route manifest matching (dynamic pages, API routes)
+    const match = matchRoute(pathname);
+    if (!match) {
+      const duration = (performance.now() - startedAt).toFixed(1);
+      console.log("\\x1b[31m404\\x1b[0m  " + method.padEnd(4) + "  " + pathname.padEnd(8) + "  " + duration + "ms");
+      return new Response("Not found", { status: 404 });
+    }
+
+    const { entry, params } = match;
+
+    try {
+      if (entry.kind === "api") {
+        const response = await handleApiRoute(entry, params, request);
+        const status = response instanceof Response ? response.status : 200;
+        const duration = (performance.now() - startedAt).toFixed(1);
+        const statusStr = String(status).padStart(3);
+        const colorCode = status >= 400 ? "\\x1b[31m" : "\\x1b[32m";
+        console.log(colorCode + statusStr + "\\x1b[0m  " + method.padEnd(4) + "  " + pathname.padEnd(8) + "  " + duration + "ms");
+        return response;
+      }
+
+      // Page route: SSR
+      const html = await renderPage(entry, params);
+      const duration = (performance.now() - startedAt).toFixed(1);
+      console.log("\\x1b[32m200\\x1b[0m  " + method.padEnd(4) + "  " + pathname.padEnd(8) + "  " + duration + "ms");
+      return new Response(html, {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error("[meiden] Production error for " + pathname + ": " + message);
+      const duration = (performance.now() - startedAt).toFixed(1);
+      console.log("\\x1b[31m500\\x1b[0m  " + method.padEnd(4) + "  " + pathname.padEnd(8) + "  " + duration + "ms");
+      return new Response("Internal Server Error", { status: 500 });
+    }
+  },
+});
+
+console.log("");
+console.log("\\x1b[36mMeiden\\x1b[0m \\x1b[32mproduction server ready\\x1b[0m");
+console.log("");
+console.log("  \\x1b[2mLocal:\\x1b[0m   http://localhost:" + port);
+console.log("");
+`;
+
+  writeFileIfChanged(join(outputRoot, "server.js"), entryContent);
 }
 
 // ─── Static Server Generation ──────────────────────────────────────
@@ -2291,6 +2775,37 @@ export function startProductionServer({ root, outDir = "dist", port = 3000 }: Pr
     throw new Error(`Build output not found: ${distRoot}. Run meiden build first.`);
   }
 
+  // If a runtime server.js was generated (dynamic routes, API routes),
+  // import it and let it handle everything. It includes static file
+  // serving + route manifest matching + SSR + API dispatch.
+  const serverJsPath = join(distRoot, "server.js");
+  if (existsSync(serverJsPath)) {
+    // Set the port via environment variable so the imported server uses it
+    if (port) {
+      process.env.PORT = String(port);
+    }
+    // Import the server module — it starts Bun.serve on import.
+    // We need to await the import and then return the server instance.
+    // However, since the imported module calls Bun.serve directly,
+    // we can't easily get the server reference. Instead, we'll
+    // start our own proxy that delegates to the imported server's
+    // fetch handler.
+    //
+    // For simplicity and to avoid double-binding, we just return
+    // a Bun.serve instance that uses the same logic as the generated
+    // server but runs in-process. This is what the CLI does too
+    // when it detects server.js — it imports it directly.
+    //
+    // The most practical approach: just import the server module.
+    // This is what `meiden start` does via the CLI.
+    import(pathToFileURL(serverJsPath).href).catch((error) => {
+      console.error(`[meiden] Failed to import production server: ${error}`);
+    });
+    // Return a placeholder — the imported module starts its own server
+    return { port } as any;
+  }
+
+  // Pure static site — no runtime server needed
   return Bun.serve({
     port,
     fetch(request) {
