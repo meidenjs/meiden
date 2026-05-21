@@ -5,6 +5,7 @@ import {
   writeFileSync,
   rmSync,
   existsSync,
+  unlinkSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -1843,6 +1844,312 @@ describe("API route hot reload regression", () => {
       expect(resB.status).toBe(200);
       expect(resB.body).toContain("v2");
       expect(resB.body).not.toContain("v1");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test PR#12: Runtime Page Route Creation ───────────────────────
+
+describe("runtime page route creation regression", () => {
+  it("should register a new page route at runtime when a page.tsx file is created (no restart)", async () => {
+    const projectRoot = join(tempRoot, "route-create-page");
+    const appDir = join(projectRoot, "src", "app");
+
+    mkdirSync(appDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Create about directory before startup so the watcher can detect
+    // files created in it (some platforms don't fire events for newly
+    // created directories)
+    const aboutDir = join(appDir, "about");
+    mkdirSync(aboutDir, { recursive: true });
+
+    // Only home page at startup
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Step 1: /about should 404 (not yet created)
+      const beforeRes = await fetchUrl(`${baseUrl}/about`);
+      expect(beforeRes.status).toBe(404);
+
+      // Step 2: Create about/page.tsx at runtime
+      writeFileSync(
+        join(aboutDir, "page.tsx"),
+        `export default function Page() { return <h1>About Page</h1>; }`,
+      );
+
+      // Step 3: Wait for the file watcher to detect the new file
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      // Step 4: /about should now return 200 with the new page
+      const afterRes = await fetchUrl(`${baseUrl}/about`);
+      expect(afterRes.status).toBe(200);
+      expect(afterRes.body).toContain("About Page");
+
+      // Home page should still work
+      const homeRes = await fetchUrl(`${baseUrl}/`);
+      expect(homeRes.status).toBe(200);
+      expect(homeRes.body).toContain("Home");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test PR#12: Runtime Page Route Deletion ───────────────────────
+
+describe("runtime page route deletion regression", () => {
+  it("should return 404 for a deleted page route at runtime (no restart)", async () => {
+    const projectRoot = join(tempRoot, "route-delete-page");
+    const appDir = join(projectRoot, "src", "app");
+    const aboutDir = join(appDir, "about");
+
+    mkdirSync(aboutDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Home page
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+
+    // About page
+    writeFileSync(
+      join(aboutDir, "page.tsx"),
+      `export default function Page() { return <h1>About Page</h1>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Step 1: /about should return 200
+      const beforeRes = await fetchUrl(`${baseUrl}/about`);
+      expect(beforeRes.status).toBe(200);
+      expect(beforeRes.body).toContain("About Page");
+
+      // Step 2: Delete about/page.tsx
+      unlinkSync(join(aboutDir, "page.tsx"));
+
+      // Step 3: Wait for the file watcher to detect the deletion
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      // Step 4: /about should now return 404
+      const afterRes = await fetchUrl(`${baseUrl}/about`);
+      expect(afterRes.status).toBe(404);
+
+      // Home page should still work
+      const homeRes = await fetchUrl(`${baseUrl}/`);
+      expect(homeRes.status).toBe(200);
+      expect(homeRes.body).toContain("Home");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test PR#12: Runtime API Route Creation ────────────────────────
+
+describe("runtime API route creation regression", () => {
+  it("should register a new API route at runtime when a route.tsx file is created (no restart)", async () => {
+    const projectRoot = join(tempRoot, "route-create-api");
+    const appDir = join(projectRoot, "src", "app");
+    const apiDir = join(appDir, "api", "status");
+
+    mkdirSync(appDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Home page
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+
+    // Create api/status directory before startup so the watcher can
+    // detect files created in it
+    mkdirSync(apiDir, { recursive: true });
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Step 1: /api/status should 404
+      const beforeRes = await fetchUrl(`${baseUrl}/api/status`);
+      expect(beforeRes.status).toBe(404);
+
+      // Step 2: Create api/status/route.tsx at runtime
+      writeFileSync(
+        join(apiDir, "route.tsx"),
+        `export function GET() { return { ok: true }; }`,
+      );
+
+      // Step 3: Wait for the file watcher
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      // Step 4: /api/status should now return 200 with JSON
+      const afterRes = await fetchUrl(`${baseUrl}/api/status`);
+      expect(afterRes.status).toBe(200);
+      expect(afterRes.body).toContain('"ok"');
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test PR#12: Runtime Nested Layout Creation ────────────────────
+
+describe("runtime nested layout creation regression", () => {
+  it("should apply a newly created nested layout to existing pages at runtime (no restart)", async () => {
+    const projectRoot = join(tempRoot, "layout-create-nested");
+    const appDir = join(projectRoot, "src", "app");
+    const blogDir = join(appDir, "blog");
+
+    mkdirSync(blogDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Root layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div className="root">{children}</div>; }`,
+    );
+
+    // Home page
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+
+    // Blog page (no layout yet)
+    writeFileSync(
+      join(blogDir, "page.tsx"),
+      `export default function Page() { return <h1>Blog</h1>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Step 1: /blog should only have root layout
+      const beforeRes = await fetchUrl(`${baseUrl}/blog`);
+      expect(beforeRes.status).toBe(200);
+      expect(beforeRes.body).toContain("Blog");
+      expect(beforeRes.body).toContain("root");
+      expect(beforeRes.body).not.toContain("blog-layout");
+
+      // Step 2: Create blog/layout.tsx
+      writeFileSync(
+        join(blogDir, "layout.tsx"),
+        `export default function BlogLayout({ children }: { children: any }) { return <section className="blog-layout">{children}</section>; }`,
+      );
+
+      // Step 3: Wait for the file watcher
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      // Step 4: /blog should now have the blog layout wrapper
+      const afterRes = await fetchUrl(`${baseUrl}/blog`);
+      expect(afterRes.status).toBe(200);
+      expect(afterRes.body).toContain("Blog");
+      expect(afterRes.body).toContain("blog-layout");
+
+      // Home page should NOT have blog layout
+      const homeRes = await fetchUrl(`${baseUrl}/`);
+      expect(homeRes.status).toBe(200);
+      expect(homeRes.body).toContain("root");
+      expect(homeRes.body).not.toContain("blog-layout");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test PR#12: Runtime Nested Layout Deletion ────────────────────
+
+describe("runtime nested layout deletion regression", () => {
+  it("should remove layout wrapper when nested layout is deleted at runtime (no restart)", async () => {
+    const projectRoot = join(tempRoot, "layout-delete-nested");
+    const appDir = join(projectRoot, "src", "app");
+    const blogDir = join(appDir, "blog");
+
+    mkdirSync(blogDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Root layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div className="root">{children}</div>; }`,
+    );
+
+    // Blog layout
+    writeFileSync(
+      join(blogDir, "layout.tsx"),
+      `export default function BlogLayout({ children }: { children: any }) { return <section className="blog-layout">{children}</section>; }`,
+    );
+
+    // Home page
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+
+    // Blog page
+    writeFileSync(
+      join(blogDir, "page.tsx"),
+      `export default function Page() { return <h1>Blog</h1>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Step 1: /blog should have both root and blog layout
+      const beforeRes = await fetchUrl(`${baseUrl}/blog`);
+      expect(beforeRes.status).toBe(200);
+      expect(beforeRes.body).toContain("Blog");
+      expect(beforeRes.body).toContain("blog-layout");
+
+      // Step 2: Delete blog/layout.tsx
+      unlinkSync(join(blogDir, "layout.tsx"));
+
+      // Step 3: Wait for the file watcher
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      // Step 4: /blog should still work but without blog-layout wrapper
+      const afterRes = await fetchUrl(`${baseUrl}/blog`);
+      expect(afterRes.status).toBe(200);
+      expect(afterRes.body).toContain("Blog");
+      expect(afterRes.body).toContain("root");
+      expect(afterRes.body).not.toContain("blog-layout");
     } finally {
       app.stop?.();
       rmSync(projectRoot, { recursive: true, force: true });
