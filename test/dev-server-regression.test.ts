@@ -783,3 +783,211 @@ describe("island nested dependency hot reload regression", () => {
     }
   });
 });
+
+// ─── Test 13: Dynamic Route [slug] ──────────────────────────────────
+
+describe("dynamic route [slug] regression", () => {
+  it("should match /blog/[slug] and pass params to the page component", async () => {
+    const projectRoot = join(tempRoot, "dynamic-route-slug");
+    const appDir = join(projectRoot, "src", "app");
+    const blogSlugDir = join(appDir, "blog", "[slug]");
+
+    mkdirSync(blogSlugDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Static home page
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+
+    // Dynamic blog page — renders the slug param
+    writeFileSync(
+      join(blogSlugDir, "page.tsx"),
+      `export default function BlogPost({ params }: { params: { slug: string } }) { return <article>Post: {params.slug}</article>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Static route still works
+      const homeRes = await fetchUrl(`${baseUrl}/`);
+      expect(homeRes.status).toBe(200);
+      expect(homeRes.body).toContain("Home");
+
+      // Dynamic route /blog/hello-world should match and pass slug param
+      const slugRes = await fetchUrl(`${baseUrl}/blog/hello-world`);
+      expect(slugRes.status).toBe(200);
+      expect(slugRes.body).toContain("hello-world");
+      expect(slugRes.body).toContain("Post:");
+
+      // Another slug value
+      const slugRes2 = await fetchUrl(`${baseUrl}/blog/meiden-framework`);
+      expect(slugRes2.status).toBe(200);
+      expect(slugRes2.body).toContain("meiden-framework");
+
+      // Non-matching path should 404
+      const notFoundRes = await fetchUrl(`${baseUrl}/blog`);
+      expect(notFoundRes.status).toBe(404);
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test 14: Dynamic Route [...path] (catch-all) ──────────────────
+
+describe("dynamic route [...path] catch-all regression", () => {
+  it("should match /docs/[...path] and pass multi-segment path param", async () => {
+    const projectRoot = join(tempRoot, "dynamic-route-wildcard");
+    const appDir = join(projectRoot, "src", "app");
+    const docsCatchAllDir = join(appDir, "docs", "[...path]");
+
+    mkdirSync(docsCatchAllDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Static home page
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+
+    // Catch-all docs page — renders the full path
+    writeFileSync(
+      join(docsCatchAllDir, "page.tsx"),
+      `export default function DocsPage({ params }: { params: { path: string } }) { return <div>Docs: {params.path}</div>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Single-segment catch-all
+      const singleRes = await fetchUrl(`${baseUrl}/docs/getting-started`);
+      expect(singleRes.status).toBe(200);
+      expect(singleRes.body).toContain("getting-started");
+      expect(singleRes.body).toContain("Docs:");
+
+      // Multi-segment catch-all
+      const multiRes = await fetchUrl(`${baseUrl}/docs/api/reference/routes`);
+      expect(multiRes.status).toBe(200);
+      expect(multiRes.body).toContain("api/reference/routes");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test 15: Static Route Priority Over Dynamic ────────────────────
+
+describe("static route priority over dynamic regression", () => {
+  it("should match static /blog/archive before dynamic /blog/[slug]", async () => {
+    const projectRoot = join(tempRoot, "static-priority");
+    const appDir = join(projectRoot, "src", "app");
+    const blogSlugDir = join(appDir, "blog", "[slug]");
+    const blogArchiveDir = join(appDir, "blog", "archive");
+
+    mkdirSync(blogSlugDir, { recursive: true });
+    mkdirSync(blogArchiveDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Static home page
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+
+    // Dynamic blog slug page
+    writeFileSync(
+      join(blogSlugDir, "page.tsx"),
+      `export default function BlogPost({ params }: { params: { slug: string } }) { return <article>Slug: {params.slug}</article>; }`,
+    );
+
+    // Static archive page — should take priority over [slug]
+    writeFileSync(
+      join(blogArchiveDir, "page.tsx"),
+      `export default function ArchivePage() { return <div>Archive</div>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // /blog/archive should match the static route, NOT [slug]
+      const archiveRes = await fetchUrl(`${baseUrl}/blog/archive`);
+      expect(archiveRes.status).toBe(200);
+      expect(archiveRes.body).toContain("Archive");
+      expect(archiveRes.body).not.toContain("article"); // dynamic page uses <article>
+
+      // /blog/other should match the dynamic [slug] route
+      const slugRes = await fetchUrl(`${baseUrl}/blog/my-post`);
+      expect(slugRes.status).toBe(200);
+      expect(slugRes.body).toContain("my-post");
+      expect(slugRes.body).toContain("Slug:");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test 16: Multiple Dynamic Segments ─────────────────────────────
+
+describe("multiple dynamic segments regression", () => {
+  it("should match /user/[id]/post/[postId] and pass both params", async () => {
+    const projectRoot = join(tempRoot, "multi-dynamic-segments");
+    const appDir = join(projectRoot, "src", "app");
+    const userPostDir = join(appDir, "user", "[id]", "post", "[postId]");
+
+    mkdirSync(userPostDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Multi-param page
+    writeFileSync(
+      join(userPostDir, "page.tsx"),
+      `export default function UserPost({ params }: { params: { id: string; postId: string } }) { return <div>User {params.id} Post {params.postId}</div>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      const res = await fetchUrl(`${baseUrl}/user/42/post/7`);
+      expect(res.status).toBe(200);
+      expect(res.body).toContain("42");
+      expect(res.body).toContain("7");
+      expect(res.body).toContain("User");
+      expect(res.body).toContain("Post");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
