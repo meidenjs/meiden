@@ -808,25 +808,39 @@ function findDependents(sourcePath: string): Set<string> {
  * processed on the call stack. A path is added on entry and removed in a
  * `finally` block on exit, so only files that are ancestors in the current
  * recursion chain remain in the set. If a circular import is detected
- * (A → B → A), the function returns the source file path directly instead
- * of recursing, breaking the cycle safely. Shared dependencies are not
- * affected because they are removed from the stack once finished:
+ * (A → B → A), the function returns the in-progress server module path
+ * instead of recursing, breaking the cycle safely. Shared dependencies
+ * are not affected because they are removed from the stack once finished:
  *
  *     page → A → Shared   (Shared removed after A finishes)
  *     page → B → Shared   (Shared not in stack — processed normally)
+ *
+ * In-progress module map: the `inProgress` map tracks the deterministic
+ * server module path for each file currently being transformed. When a
+ * circular import is detected, the cyclic reference uses this path
+ * instead of the raw source path. This ensures that even cyclic
+ * references point to a Meiden-transformed module (with `import React`,
+ * rewritten island proxies, etc.) rather than the unprocessed source.
+ *
+ * The transformed content is written to both:
+ *   1. The deterministic path (for cyclic references)
+ *   2. The content-hashed path (for HMR cache-busting)
+ * The content-hashed path is returned from the outermost call so the
+ * HMR cascade continues to work correctly.
  */
-function createServerModule(root: string, filePath: string, stack?: Set<string>) {
+function createServerModule(root: string, filePath: string, stack?: Set<string>, inProgress?: Map<string, string>) {
   const tmpDir = join(root, ".meiden", "server");
   mkdirSync(tmpDir, { recursive: true });
 
   const realPath = toPath(filePath);
 
   // Circular import guard: if this file is already being processed
-  // higher up the call stack, return its source path directly.
+  // higher up the call stack, return its in-progress server module path.
   // This prevents infinite recursion when A imports B and B imports A.
-  // The source path is safe to use as an import specifier because
-  // the file will already have been (or is being) transformed by
-  // the caller — the content-hash cascade still works correctly.
+  // Unlike returning the raw source path, the in-progress path points
+  // to a Meiden-transformed module (with `import React`, rewritten
+  // island proxies, etc.) that will be written once the outer transform
+  // completes.
   //
   // The stack behaves like a recursion stack, not a global visited set:
   // paths are added on entry and removed in a `finally` block on exit.
@@ -834,10 +848,20 @@ function createServerModule(root: string, filePath: string, stack?: Set<string>)
   // B → Shared) where Shared would otherwise remain in the set after
   // A finishes and be incorrectly treated as circular when B imports it.
   if (!stack) stack = new Set();
+  if (!inProgress) inProgress = new Map();
   if (stack.has(realPath)) {
-    return realPath;
+    // Cycle detected — return the in-progress server module path
+    // (or fall back to the raw source if not yet registered)
+    return inProgress.get(realPath) ?? realPath;
   }
   stack.add(realPath);
+
+  // Pre-compute a deterministic server module path and register it
+  // in the in-progress map before recursing into imports. This allows
+  // cyclic references to find a valid server module path even though
+  // the content-hashed path isn't known yet.
+  const deterministicPath = join(tmpDir, `route-${hash(realPath)}.tsx`);
+  inProgress.set(realPath, deterministicPath);
 
   try {
     const source = readFileSync(realPath, "utf8");
@@ -917,7 +941,7 @@ function createServerModule(root: string, filePath: string, stack?: Set<string>)
         // watcher can find which pages need re-importing when this component
         // changes.
         registerDependency(realPath, resolvedImport);
-        const depServerPath = createServerModule(root, resolvedImport, stack);
+        const depServerPath = createServerModule(root, resolvedImport, stack, inProgress);
         const newStatement = imp.statement.replace(imp.specifier, depServerPath);
         replacements.push({ start: imp.start, end: imp.end, text: newStatement });
       } else {
@@ -932,11 +956,23 @@ function createServerModule(root: string, filePath: string, stack?: Set<string>)
     }
 
     result = `import React from "react";\n${result}`;
+
+    // Write the transformed content to the deterministic path.
+    // This path is used by cyclic references (B → A when A → B → A),
+    // so it must contain the fully transformed module — not the raw
+    // source. The deterministic path is overwritten on each transform,
+    // so cyclic references always get the latest version.
+    writeFileIfChanged(deterministicPath, result);
+
+    // Also write to a content-hashed path for HMR cache-busting.
+    // When a file changes, its content hash changes → new filename →
+    // Bun's import() loads fresh code instead of the cached version.
     const serverPath = join(tmpDir, `route-${hash(`${filePath}:${result}`)}.tsx`);
     writeFileIfChanged(serverPath, result);
     return serverPath;
   } finally {
     stack.delete(realPath);
+    inProgress.delete(realPath);
   }
 }
 

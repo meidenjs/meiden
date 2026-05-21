@@ -395,6 +395,70 @@ describe("circular import guard regression", () => {
   });
 });
 
+// ─── Test 9: Circular Import with Island Proxy ────────────────────
+
+describe("circular import with island proxy regression", () => {
+  it("should return a Meiden-transformed module path (not raw source) for circular imports, so island proxies are applied correctly", async () => {
+    const projectRoot = join(tempRoot, "circular-import-island");
+    const appDir = join(projectRoot, "src", "app");
+    const componentsDir = join(appDir, "components");
+
+    mkdirSync(componentsDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Counter is a client component (island) — uses onClick
+    writeFileSync(
+      join(componentsDir, "Counter.tsx"),
+      `"use client";\nexport default function Counter() { return <button onClick={() => {}}>Click</button>; }`,
+    );
+
+    // Component A imports B (circular) and imports Counter (island proxy needed)
+    writeFileSync(
+      join(componentsDir, "A.tsx"),
+      `import B from "./B";\nimport Counter from "./Counter";\nexport default function A() { return <span>A<Counter /></span>; }\nexport { B };`,
+    );
+
+    // Component B imports A (circular!)
+    writeFileSync(
+      join(componentsDir, "B.tsx"),
+      `import A from "./A";\nexport default function B() { return <span>B</span>; }\nexport { A };`,
+    );
+
+    // Page imports A (which triggers A→B→A cycle + island proxy for Counter)
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `import A from "./components/A";\n\nexport default function Page() { return <div><A /></div>; }`,
+    );
+
+    // The server should start without infinite recursion and the
+    // circular reference should point to a Meiden-transformed module
+    // (with `import React` prepended and island proxies rewritten),
+    // not the raw source.
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      const res = await fetchUrl(`${baseUrl}/`);
+      expect(res.status).toBe(200);
+      // A should render
+      expect(res.body).toContain("A");
+      // The Counter island should render with its data-meiden-island attribute
+      // (this verifies the cyclic reference B→A used the transformed module,
+      // not the raw source which wouldn't have island proxies)
+      expect(res.body).toContain("data-meiden-island");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 // ─── Test 8: Shared Dependency (not treated as circular) ─────────
 
 describe("shared dependency not treated as circular regression", () => {
