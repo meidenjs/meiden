@@ -803,12 +803,31 @@ function findDependents(sourcePath: string): Set<string> {
  *
  * For component/utility files: same logic applies — all relative imports
  * are recursively transformed, so deep dependency chains are fully tracked.
+ *
+ * Circular import guard: the `visited` set tracks files currently being
+ * processed in the call stack. If a circular import is detected (A → B → A),
+ * the function returns the source file path directly instead of recursing,
+ * breaking the cycle safely. The content-hash cascade still works because
+ * the file is already being transformed by the caller.
  */
-function createServerModule(root: string, filePath: string) {
+function createServerModule(root: string, filePath: string, visited?: Set<string>) {
   const tmpDir = join(root, ".meiden", "server");
   mkdirSync(tmpDir, { recursive: true });
 
   const realPath = toPath(filePath);
+
+  // Circular import guard: if this file is already being processed
+  // higher up the call stack, return its source path directly.
+  // This prevents infinite recursion when A imports B and B imports A.
+  // The source path is safe to use as an import specifier because
+  // the file will already have been (or is being) transformed by
+  // the caller — the content-hash cascade still works correctly.
+  if (!visited) visited = new Set();
+  if (visited.has(realPath)) {
+    return realPath;
+  }
+  visited.add(realPath);
+
   const source = readFileSync(realPath, "utf8");
   const imports = parseImports(realPath);
 
@@ -886,7 +905,7 @@ function createServerModule(root: string, filePath: string) {
       // watcher can find which pages need re-importing when this component
       // changes.
       registerDependency(realPath, resolvedImport);
-      const depServerPath = createServerModule(root, resolvedImport);
+      const depServerPath = createServerModule(root, resolvedImport, visited);
       const newStatement = imp.statement.replace(imp.specifier, depServerPath);
       replacements.push({ start: imp.start, end: imp.end, text: newStatement });
     } else {

@@ -344,6 +344,57 @@ describe("hot reload regression", () => {
   });
 });
 
+// ─── Test 7: Circular Import ─────────────────────────────────────
+
+describe("circular import guard regression", () => {
+  it("should start server without stack overflow when components have circular imports", async () => {
+    const projectRoot = join(tempRoot, "circular-import");
+    const appDir = join(projectRoot, "src", "app");
+    const componentsDir = join(appDir, "components");
+
+    mkdirSync(componentsDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Component A imports B
+    writeFileSync(
+      join(componentsDir, "A.tsx"),
+      `import B from "./B";\nexport default function A() { return <span>A</span>; }\nexport { B };`,
+    );
+
+    // Component B imports A (circular!)
+    writeFileSync(
+      join(componentsDir, "B.tsx"),
+      `import A from "./A";\nexport default function B() { return <span>B</span>; }\nexport { A };`,
+    );
+
+    // Page imports A
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `import A from "./components/A";\n\nexport default function Page() { return <div><A /></div>; }`,
+    );
+
+    // The server should start without infinite recursion
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Page should render successfully (component A works)
+      const res = await fetchUrl(`${baseUrl}/`);
+      expect(res.status).toBe(200);
+      expect(res.body).toContain("A");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 // ─── Test 6: Component Hot Reload ────────────────────────────────
 
 describe("component hot reload regression", () => {
