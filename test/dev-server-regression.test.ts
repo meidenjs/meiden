@@ -86,8 +86,9 @@ async function startDevServer(
 /** Fetch a URL and return { status, headers, body } */
 async function fetchUrl(
   url: string,
+  init?: RequestInit,
 ): Promise<{ status: number; headers: Headers; body: string }> {
-  const res = await fetch(url);
+  const res = await fetch(url, init);
   const body = await res.text();
   return { status: res.status, headers: res.headers, body };
 }
@@ -1481,6 +1482,367 @@ describe("broken nested layout isolation regression", () => {
       // Blog page should 500 (broken nested layout)
       const blogRes = await fetchUrl(`${baseUrl}/blog/test`);
       expect(blogRes.status).toBe(500);
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test 26: API Route GET Handler ─────────────────────────────────
+
+describe("API route GET handler regression", () => {
+  it("should handle GET requests to API routes and return JSON", async () => {
+    const projectRoot = join(tempRoot, "api-route-get");
+    const appDir = join(projectRoot, "src", "app");
+    const apiDir = join(appDir, "api", "hello");
+
+    mkdirSync(apiDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Root layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Home page
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+
+    // API route at /api/hello
+    writeFileSync(
+      join(apiDir, "route.ts"),
+      `export function GET() { return { message: "Hello from API" }; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // API route should return JSON
+      const apiRes = await fetchUrl(`${baseUrl}/api/hello`);
+      expect(apiRes.status).toBe(200);
+      expect(apiRes.body).toContain("Hello from API");
+      expect(apiRes.headers.get("content-type")).toContain("application/json");
+
+      // Page route should still work
+      const pageRes = await fetchUrl(`${baseUrl}/`);
+      expect(pageRes.status).toBe(200);
+      expect(pageRes.body).toContain("Home");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test 27: API Route POST Handler ────────────────────────────────
+
+describe("API route POST handler regression", () => {
+  it("should handle POST requests to API routes", async () => {
+    const projectRoot = join(tempRoot, "api-route-post");
+    const appDir = join(projectRoot, "src", "app");
+    const apiDir = join(appDir, "api", "items");
+
+    mkdirSync(apiDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Root layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Home page
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+
+    // API route with GET and POST
+    writeFileSync(
+      join(apiDir, "route.ts"),
+      `export function GET() { return { items: [] }; }\nexport async function POST({ request }: { request: Request }) { const body = await request.json(); return { created: body }; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // GET should return empty list
+      const getRes = await fetchUrl(`${baseUrl}/api/items`);
+      expect(getRes.status).toBe(200);
+      expect(getRes.body).toContain("items");
+
+      // POST should echo the body
+      const postRes = await fetchUrl(`${baseUrl}/api/items`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "Test Item" }),
+      });
+      expect(postRes.status).toBe(200);
+      expect(postRes.body).toContain("Test Item");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test 28: API Route 405 Method Not Allowed ──────────────────────
+
+describe("API route 405 method not allowed regression", () => {
+  it("should return 405 for unsupported HTTP methods on API routes", async () => {
+    const projectRoot = join(tempRoot, "api-route-405");
+    const appDir = join(projectRoot, "src", "app");
+    const apiDir = join(appDir, "api", "readonly");
+
+    mkdirSync(apiDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Root layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Home page
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+
+    // API route with only GET
+    writeFileSync(
+      join(apiDir, "route.ts"),
+      `export function GET() { return { data: "read-only" }; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // GET should work
+      const getRes = await fetchUrl(`${baseUrl}/api/readonly`);
+      expect(getRes.status).toBe(200);
+      expect(getRes.body).toContain("read-only");
+
+      // POST should return 405
+      const postRes = await fetchUrl(`${baseUrl}/api/readonly`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      expect(postRes.status).toBe(405);
+      expect(postRes.headers.get("Allow")).toContain("GET");
+
+      // DELETE should also return 405
+      const deleteRes = await fetchUrl(`${baseUrl}/api/readonly`, {
+        method: "DELETE",
+      });
+      expect(deleteRes.status).toBe(405);
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test 29: API Route with Dynamic Params ─────────────────────────
+
+describe("API route with dynamic params regression", () => {
+  it("should pass URL params to API route handlers", async () => {
+    const projectRoot = join(tempRoot, "api-route-params");
+    const appDir = join(projectRoot, "src", "app");
+    const apiDir = join(appDir, "api", "users", "[id]");
+
+    mkdirSync(apiDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Root layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Home page
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+
+    // API route with dynamic param
+    writeFileSync(
+      join(apiDir, "route.ts"),
+      `export function GET({ params }: { params: { id: string } }) { return { userId: params.id, name: "User " + params.id }; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      const res = await fetchUrl(`${baseUrl}/api/users/42`);
+      expect(res.status).toBe(200);
+      expect(res.body).toContain("42");
+      expect(res.body).toContain("User 42");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test 30: API Route Priority Over Page at Same Path ─────────────
+
+describe("API route priority over page regression", () => {
+  it("should serve API route instead of page when both exist at same path", async () => {
+    const projectRoot = join(tempRoot, "api-route-priority");
+    const appDir = join(projectRoot, "src", "app");
+    const apiDir = join(appDir, "api", "data");
+
+    mkdirSync(apiDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Root layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Home page
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+
+    // Page at /api/data
+    writeFileSync(
+      join(apiDir, "page.tsx"),
+      `export default function DataPage() { return <div>Data Page</div>; }`,
+    );
+
+    // API route at /api/data
+    writeFileSync(
+      join(apiDir, "route.ts"),
+      `export function GET() { return { api: true, data: "from-api" }; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // /api/data should return API route, not page
+      const res = await fetchUrl(`${baseUrl}/api/data`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      expect(res.body).toContain("from-api");
+      expect(res.body).not.toContain("Data Page");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test 31: API Route Returns Custom Response ──────────────────────
+
+describe("API route custom response regression", () => {
+  it("should return custom Response objects from API handlers directly", async () => {
+    const projectRoot = join(tempRoot, "api-route-custom-response");
+    const appDir = join(projectRoot, "src", "app");
+    const apiDir = join(appDir, "api", "custom");
+
+    mkdirSync(apiDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Root layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Home page
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+
+    // API route returning custom Response
+    writeFileSync(
+      join(apiDir, "route.ts"),
+      `export function GET() { return new Response("Plain text response", { status: 200, headers: { "Content-Type": "text/plain" } }); }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      const res = await fetchUrl(`${baseUrl}/api/custom`);
+      expect(res.status).toBe(200);
+      expect(res.body).toBe("Plain text response");
+      expect(res.headers.get("content-type")).toContain("text/plain");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test 32: API Route Hot Reload ──────────────────────────────────
+
+describe("API route hot reload regression", () => {
+  it("should serve updated API response after route file is modified (no restart)", async () => {
+    const projectRoot = join(tempRoot, "api-route-hot-reload");
+    const appDir = join(projectRoot, "src", "app");
+    const apiDir = join(appDir, "api", "version");
+
+    mkdirSync(apiDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Root layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Home page
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+
+    // API route — initially returns v1
+    writeFileSync(
+      join(apiDir, "route.ts"),
+      `export function GET() { return { version: "v1" }; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Step 1: Request API and get v1
+      const resA = await fetchUrl(`${baseUrl}/api/version`);
+      expect(resA.status).toBe(200);
+      expect(resA.body).toContain("v1");
+
+      // Step 2: Edit route.ts to v2
+      writeFileSync(
+        join(apiDir, "route.ts"),
+        `export function GET() { return { version: "v2" }; }`,
+      );
+
+      // Step 3: Wait for file watcher
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      // Step 4: Request again — should get v2
+      const resB = await fetchUrl(`${baseUrl}/api/version`);
+      expect(resB.status).toBe(200);
+      expect(resB.body).toContain("v2");
+      expect(resB.body).not.toContain("v1");
     } finally {
       app.stop?.();
       rmSync(projectRoot, { recursive: true, force: true });

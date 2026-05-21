@@ -85,6 +85,8 @@ interface AppRoute {
  */
 type SegmentKind = "static" | "param" | "wildcard";
 
+type RouteKind = "page" | "api";
+
 /**
  * A single parsed segment of a route pattern.
  * For `/blog/[slug]` this produces two segments:
@@ -125,8 +127,8 @@ interface RouteSegment {
  *   }
  */
 interface RouteManifestEntry {
-  /** "page" for page routes (future: "api" for API routes) */
-  kind: "page";
+  /** "page" for page routes, "api" for API routes */
+  kind: RouteKind;
   /** The route pattern with bracket notation (e.g. "/blog/[slug]") */
   path: string;
   /** Compiled regex for matching URL paths and extracting params */
@@ -139,8 +141,15 @@ interface RouteManifestEntry {
   filePath: string;
   /** Whether this route has any dynamic segments */
   isDynamic: boolean;
-  /** Loaded page component (undefined until loaded) */
+  /** Loaded page component (undefined until loaded, only for kind: "page") */
   Page?: Component;
+  /**
+   * Loaded API route handlers (only for kind: "api").
+   * Maps HTTP method names ("GET", "POST", "PUT", "DELETE", "PATCH",
+   * "HEAD", "OPTIONS") to handler functions.
+   * If a request uses a method not in this map, the server returns 405.
+   */
+  handlers?: Record<string, (ctx: ApiRouteContext) => any | Promise<any>>;
   /**
    * Ordered list of layout file paths from root to nearest route directory.
    * For a page at app/blog/[slug]/page.tsx, this would be:
@@ -166,7 +175,24 @@ interface IslandReference {
 const moduleExtensions = [".tsx", ".ts", ".jsx", ".js"];
 const configExtensions = [".ts", ".js", ".mjs", ".mts", ".cjs"];
 const routeFilePattern = /(^|\/)page\.(tsx|ts|jsx|js)$/;
+const apiRouteFilePattern = /(^|\/)route\.(tsx|ts|jsx|js)$/;
 const layoutFilePattern = /(^|\/)layout\.(tsx|ts|jsx|js)$/;
+
+/** HTTP methods that API routes can export as handlers */
+const API_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"] as const;
+type ApiMethod = typeof API_METHODS[number];
+
+/**
+ * Context object passed to API route handler functions.
+ * Provides access to the request, URL params, and utility methods
+ * for building responses.
+ */
+interface ApiRouteContext {
+  /** The original Request object */
+  request: Request;
+  /** URL params extracted from dynamic segments (e.g. { slug: "hello" }) */
+  params: Record<string, string>;
+}
 
 const reactHooks = new Set([
   "useState",
@@ -1204,15 +1230,16 @@ function parseSegment(raw: string): RouteSegment {
  *   app/blog/[slug]/page.tsx  → path: "/blog/[slug]", pattern: /^\/blog\/([^/]+)$/, params: ["slug"]
  *   app/docs/[...path]/page.tsx → path: "/docs/[...path]", pattern: /^\/docs\/([^/]+(?:\/[^/]+)*)$/, params: ["path"]
  */
-function buildRouteManifestEntry(appDir: string, filePath: string): RouteManifestEntry {
+function buildRouteManifestEntry(appDir: string, filePath: string, kind: RouteKind): RouteManifestEntry {
+  const filePattern = kind === "page" ? routeFilePattern : apiRouteFilePattern;
   const relativePath = filePath.slice(appDir.length + 1);
-  const routeDir = relativePath.replace(routeFilePattern, "");
+  const routeDir = relativePath.replace(filePattern, "");
 
-  // Root page: app/page.tsx → "/"
-  // No nested layouts possible for the root page
+  // Root page/route: app/page.tsx → "/" or app/route.ts → "/"
+  // No nested layouts possible for the root
   if (!routeDir) {
     return {
-      kind: "page",
+      kind,
       path: "/",
       pattern: /^\/$/,
       segments: [],
@@ -1264,7 +1291,7 @@ function buildRouteManifestEntry(appDir: string, filePath: string): RouteManifes
   const layouts = resolveLayoutChain(appDir, filePath);
 
   return {
-    kind: "page",
+    kind,
     path,
     pattern,
     segments,
@@ -1369,11 +1396,14 @@ function matchRoute(
  *   /docs/[...path] (wildcard)
  */
 function buildRouteManifest(appDir: string): RouteManifestEntry[] {
-  const routeFiles = scanAppRoutes(appDir);
-  const entries = routeFiles.map(filePath => buildRouteManifestEntry(appDir, filePath));
+  const { pageFiles, apiFiles } = scanAppRoutes(appDir);
+  const pageEntries = pageFiles.map(filePath => buildRouteManifestEntry(appDir, filePath, "page"));
+  const apiEntries = apiFiles.map(filePath => buildRouteManifestEntry(appDir, filePath, "api"));
+  const entries = [...pageEntries, ...apiEntries];
 
   // Sort: static routes first, then by specificity (more static segments first),
-  // then params before wildcards, then alphabetically
+  // then params before wildcards, then alphabetically.
+  // API routes take priority over page routes at the same path.
   entries.sort((a, b) => {
     // Static routes before dynamic routes
     if (!a.isDynamic && b.isDynamic) return -1;
@@ -1389,6 +1419,11 @@ function buildRouteManifest(appDir: string): RouteManifestEntry[] {
     const bWildcard = b.segments.some(s => s.kind === "wildcard");
     if (aWildcard !== bWildcard) return aWildcard ? 1 : -1;
 
+    // API routes take priority over page routes at the same path
+    if (a.path === b.path && a.kind !== b.kind) {
+      return a.kind === "api" ? -1 : 1;
+    }
+
     // Alphabetical as tiebreaker
     return a.path.localeCompare(b.path);
   });
@@ -1396,8 +1431,9 @@ function buildRouteManifest(appDir: string): RouteManifestEntry[] {
   return entries;
 }
 
-function scanAppRoutes(appDir: string) {
-  const routes: string[] = [];
+function scanAppRoutes(appDir: string): { pageFiles: string[]; apiFiles: string[] } {
+  const pageFiles: string[] = [];
+  const apiFiles: string[] = [];
 
   function walk(dir: string) {
     for (const entry of readdirSync(dir)) {
@@ -1410,13 +1446,15 @@ function scanAppRoutes(appDir: string) {
       }
 
       if (routeFilePattern.test(fullPath)) {
-        routes.push(fullPath);
+        pageFiles.push(fullPath);
+      } else if (apiRouteFilePattern.test(fullPath)) {
+        apiFiles.push(fullPath);
       }
     }
   }
 
   walk(appDir);
-  return routes;
+  return { pageFiles, apiFiles };
 }
 
 /**
@@ -1549,39 +1587,64 @@ async function loadAppModules(root: string, config: MeidenConfig): Promise<AppMo
   const manifest = buildRouteManifest(appDir);
 
   if (!layoutModule.default || manifest.length === 0) {
-    throw new Error("Meiden app router projects must export src/app/layout and at least one page.");
+    throw new Error("Meiden app router projects must export src/app/layout and at least one page or route.");
   }
 
-  // Load each route module in isolation — a broken page should not
-  // kill the entire server. Failed routes get an error-page component
-  // that renders a 500 when visited.
+  // Load each route module in isolation — a broken page/api route should not
+  // kill the entire server. Failed routes get an error handler that
+  // triggers a 500 when visited.
   const routes = await Promise.all(
     manifest.map(async (entry) => {
       try {
-        const pageModule = await import(pathToFileURL(createServerModule(root, entry.filePath)).href);
+        const routeModule = await import(pathToFileURL(createServerModule(root, entry.filePath)).href);
 
-        if (!pageModule.default) {
-          console.warn(`[meiden] Page has no default export: ${entry.filePath}`);
+        if (entry.kind === "page") {
+          if (!routeModule.default) {
+            console.warn(`[meiden] Page has no default export: ${entry.filePath}`);
+            return {
+              ...entry,
+              Page: () => {
+                throw new Error(`Page missing default export: ${entry.filePath}`);
+              },
+            };
+          }
           return {
             ...entry,
-            Page: () => {
-              throw new Error(`Page missing default export: ${entry.filePath}`);
-            },
+            Page: routeModule.default,
           };
         }
 
+        // API route: collect exported HTTP method handlers
+        const handlers: Record<string, (ctx: ApiRouteContext) => any | Promise<any>> = {};
+        for (const method of API_METHODS) {
+          if (typeof routeModule[method] === "function") {
+            handlers[method] = routeModule[method];
+          }
+        }
+        if (Object.keys(handlers).length === 0) {
+          console.warn(`[meiden] API route has no HTTP method exports: ${entry.filePath}`);
+        }
         return {
           ...entry,
-          Page: pageModule.default,
+          handlers,
         };
       } catch (error) {
         // Import-time failure (syntax error, missing dep, etc.)
         const message = error instanceof Error ? error.message : String(error);
-        console.error(`[meiden] Failed to load page module ${entry.filePath}: ${message}`);
+        console.error(`[meiden] Failed to load ${entry.kind} module ${entry.filePath}: ${message}`);
+        if (entry.kind === "page") {
+          return {
+            ...entry,
+            Page: () => {
+              throw new Error(`Failed to load page: ${message}`);
+            },
+          };
+        }
+        // API route failure: set a handler that always throws
         return {
           ...entry,
-          Page: () => {
-            throw new Error(`Failed to load page: ${message}`);
+          handlers: {
+            GET: () => { throw new Error(`Failed to load API route: ${message}`); },
           },
         };
       }
@@ -1980,6 +2043,9 @@ export async function buildApp({
   copyPublicDir(join(projectRoot, "public"), outputRoot);
 
   for (const route of routes) {
+    // API routes don't produce HTML — skip them in the static build
+    if (route.kind === "api") continue;
+
     const LayoutWrapper = createLayoutWrapper(RootLayout, route.layouts, nestedLayouts);
     const html = await renderRoute(projectRoot, LayoutWrapper, route);
     rendered.set(route, html);
@@ -2383,6 +2449,47 @@ async function hotReloadNestedLayout(
 }
 
 /**
+ * Hot-reload an API route module. Regenerates the server module,
+ * re-imports it, and updates the handlers on the route manifest entry.
+ * Errors are logged but do not crash the server — the old handlers
+ * stay active until the broken file is fixed.
+ */
+async function hotReloadApiRoute(
+  projectRoot: string,
+  routeStore: RouteStore,
+  filePath: string,
+) {
+  const existingEntry = routeStore.routesByFilePath.get(filePath);
+  if (!existingEntry || existingEntry.kind !== "api") {
+    console.warn(`[meiden] Hot reload: no API route entry for ${filePath}`);
+    return;
+  }
+
+  try {
+    const serverModulePath = createServerModule(projectRoot, filePath);
+    const routeModule = await import(pathToFileURL(serverModulePath).href);
+
+    const handlers: Record<string, (ctx: ApiRouteContext) => any | Promise<any>> = {};
+    for (const method of API_METHODS) {
+      if (typeof routeModule[method] === "function") {
+        handlers[method] = routeModule[method];
+      }
+    }
+
+    if (Object.keys(handlers).length === 0) {
+      console.warn(`[meiden] Hot reload: API route has no HTTP method exports: ${filePath}`);
+    }
+
+    existingEntry.handlers = handlers;
+    console.log(`[meiden] Hot reload: API route ${existingEntry.path}`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[meiden] Hot reload failed for API route ${filePath}: ${message}`);
+    // Keep the old handlers active
+  }
+}
+
+/**
  * Hot-reload a component (or any non-page/layout) file. Uses the
  * dependency graph to find all pages and layouts that import this
  * file (directly or transitively), then re-imports each one.
@@ -2425,10 +2532,12 @@ async function hotReloadComponent(
       }
     } else if (routeFilePattern.test(depPath)) {
       await hotReloadPage(projectRoot, config, routeStore, depPath);
+    } else if (apiRouteFilePattern.test(depPath)) {
+      await hotReloadApiRoute(projectRoot, routeStore, depPath);
     }
-    // Intermediate (non-page, non-layout) dependents don't need
+    // Intermediate (non-page, non-layout, non-api) dependents don't need
     // explicit handling — they are automatically re-transformed when
-    // createServerModule runs recursively for the page/layout.
+    // createServerModule runs recursively for the page/layout/api-route.
   }
 }
 
@@ -2462,9 +2571,22 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
   for (const route of initialRoutes) {
     routesByFilePath.set(route.filePath, route);
     if (route.isDynamic) {
-      dynamicRoutes.push(route);
+      // For dynamic routes, API routes take priority over page routes.
+      // Since entries are sorted with API routes first at the same path,
+      // avoid adding a page route if an API route with the same pattern
+      // already exists in the array.
+      const existingIdx = dynamicRoutes.findIndex(r => r.path === route.path);
+      if (existingIdx === -1) {
+        dynamicRoutes.push(route);
+      }
+      // If an API route already exists at this path, skip the page route
     } else {
-      staticRoutes.set(route.path, route);
+      // For static routes, API routes take priority over page routes.
+      // Since entries are sorted with API routes first at the same path,
+      // the first entry wins — later page entries at the same path are skipped.
+      if (!staticRoutes.has(route.path)) {
+        staticRoutes.set(route.path, route);
+      }
     }
   }
 
@@ -2529,17 +2651,16 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
     return buildIslandModule(projectRoot, decodeURIComponent(params.source), String(query.name ?? "default"));
   });
 
-  // Catch-all page route handler — matches both static and dynamic routes.
-  // Instead of registering each route individually with Elysia (which only
-  // supports exact path matching), we register a single catch-all handler
-  // that uses the route manifest for matching:
+  // Catch-all route handler — matches both static and dynamic routes for
+  // both page rendering and API route handling. Instead of registering
+  // each route individually with Elysia, we register a single catch-all
+  // handler that uses the route manifest for matching:
   //   1. Try static routes first (O(1) Map lookup)
   //   2. Try dynamic routes by regex pattern matching
-  //   3. Fall through to static file serving or 404
-  //
-  // This replaces the old approach of `for (route of initialRoutes) app.get(...)`
-  // which couldn't handle dynamic segments like [slug] or [...path].
-  app.get("/*", async ({ request }) => {
+  //   3. For API routes: dispatch to the method handler (405 if missing)
+  //   4. For page routes: SSR render with layouts
+  //   5. Fall through to static file serving or 404
+  app.all("/*", async ({ request }) => {
     const startedAt = performance.now();
     const url = new URL(request.url);
     const pathname = url.pathname;
@@ -2551,6 +2672,40 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
       const { entry, params } = match;
       const routePath = entry.path;
 
+      // API route: dispatch to the HTTP method handler
+      if (entry.kind === "api") {
+        const method = request.method.toUpperCase();
+        const handler = entry.handlers?.[method];
+
+        if (!handler) {
+          // Method not supported by this API route → 405 Method Not Allowed
+          const allowed = Object.keys(entry.handlers ?? {}).join(", ");
+          logRequest(request.method, routePath, 405, startedAt);
+          return new Response("Method Not Allowed", {
+            status: 405,
+            headers: { Allow: allowed },
+          });
+        }
+
+        try {
+          const result = await handler({ request, params });
+          // If the handler returns a Response, use it directly.
+          // Otherwise, JSON-encode the result.
+          if (result instanceof Response) {
+            logRequest(request.method, routePath, result.status, startedAt);
+            return result;
+          }
+          logRequest(request.method, routePath, 200, startedAt);
+          return Response.json(result);
+        } catch (error) {
+          logRequest(request.method, routePath, 500, startedAt);
+          console.error(`[meiden] API error on ${routePath} ${method}:`, error);
+          const message = error instanceof Error ? error.message : "Internal Server Error";
+          return Response.json({ error: message }, { status: 500 });
+        }
+      }
+
+      // Page route: SSR render with layout chain
       try {
         // Create a fresh LayoutWrapper each request using the current
         // RootLayout and nested layout components from the mutable store.
@@ -2668,6 +2823,7 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
 
           const isLayoutFile = layoutFilePattern.test(file);
           const isPageFile = routeFilePattern.test(file);
+          const isApiRouteFile = apiRouteFilePattern.test(file);
 
           if (isLayoutFile) {
             // Determine if this is the root layout or a nested layout
@@ -2679,6 +2835,8 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
             }
           } else if (isPageFile) {
             await hotReloadPage(projectRoot, config, routeStore, file);
+          } else if (isApiRouteFile) {
+            await hotReloadApiRoute(projectRoot, routeStore, file);
           } else {
             // Component/utility file changed — find all pages/layouts
             // that depend on it and re-import them.
