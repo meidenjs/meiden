@@ -593,9 +593,65 @@ function getModuleExportNames(filePath: string): string[] {
  * If it crashes during rendering, the IslandErrorBoundary catches the error
  * within React's reconciliation and renders the placeholder instead.
  */
+/**
+ * Create a content-hashed SSR copy of a client component source file.
+ * Busts Bun's ESM module cache when the client component source changes.
+ *
+ * The island proxy imports the client component via `await import(path)`.
+ * If `path` is stable (the raw source path), Bun's ESM cache returns the
+ * old module after the file is edited. By writing the source to a
+ * content-hashed path (which changes when the source changes), the proxy
+ * always imports a fresh module on HMR.
+ *
+ * Relative imports inside the client component are rewritten to absolute
+ * paths so they resolve correctly from the new location in .meiden/server/.
+ */
+function createIslandSourceModule(root: string, sourcePath: string): string {
+  const tmpDir = join(root, ".meiden", "server");
+  mkdirSync(tmpDir, { recursive: true });
+
+  const source = readFileSync(sourcePath, "utf8");
+  const sourceHash = hash(source);
+
+  // Rewrite relative imports to absolute paths so they resolve correctly
+  // from .meiden/server/ instead of the original source directory.
+  const imports = parseImports(sourcePath);
+  const replacements: Array<{ start: number; end: number; text: string }> = [];
+
+  for (const imp of imports) {
+    if (!imp.specifier.startsWith(".")) continue;
+
+    const resolvedImport = resolveImport(sourcePath, imp.specifier);
+    if (!resolvedImport) continue;
+
+    const newStatement = imp.statement.replace(imp.specifier, resolvedImport);
+    replacements.push({ start: imp.start, end: imp.end, text: newStatement });
+  }
+
+  // Apply replacements from end to start to preserve offsets
+  let result = source;
+  for (const rep of replacements.sort((a, b) => b.start - a.start)) {
+    result = result.slice(0, rep.start) + rep.text + result.slice(rep.end);
+  }
+
+  // Prepend React import for JSX support
+  result = `import React from "react";\n${result}`;
+
+  const outputPath = join(tmpDir, `island-src-${hash(sourcePath)}-${sourceHash}.tsx`);
+  writeFileIfChanged(outputPath, result);
+  return outputPath;
+}
+
 function createIslandProxy(root: string, sourcePath: string, exportNames: string[]) {
   const tmpDir = join(root, ".meiden", "server");
   mkdirSync(tmpDir, { recursive: true });
+
+  // Create a content-hashed SSR copy of the client component source.
+  // The island proxy imports this hashed copy instead of the raw source
+  // path, which busts Bun's ESM cache when the client component changes.
+  // When the source changes: new hash → new file → proxy content changes
+  // → proxy hash changes → page server module hash changes → fresh code.
+  const hashedSourcePath = createIslandSourceModule(root, sourcePath);
 
   // If exportNames contains "*", resolve to actual module exports.
   // This handles namespace imports like `import * as Counter from "./Counter"`
@@ -617,7 +673,7 @@ function createIslandProxy(root: string, sourcePath: string, exportNames: string
 
   const source = escapeJsString(relative(root, sourcePath).replaceAll("\\", "/"));
   const uniqueExports = [...new Set(resolvedExportNames.length > 0 ? resolvedExportNames : ["default"])];
-  const absolutePath = escapeJsString(sourcePath.replaceAll("\\", "/"));
+  const absolutePath = escapeJsString(hashedSourcePath.replaceAll("\\", "/"));
 
   // Synchronous proxy functions that use the module loaded via top-level await.
   // If import failed, the function returns a placeholder div.
