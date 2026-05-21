@@ -2541,6 +2541,239 @@ async function hotReloadComponent(
   }
 }
 
+// ─── Runtime Route Lifecycle Handlers ───────────────────────────────
+//
+// These handlers are called by the file watcher when route or layout
+// files are created or deleted at runtime (without a full server
+// restart). They update the mutable routeStore in-place so that the
+// next request reflects the change.
+
+/**
+ * Handle a new route file (page.tsx or route.tsx) being created.
+ * Builds the manifest entry, loads the module with error isolation,
+ * and adds it to the route store following the same priority logic
+ * as startServer's initial route loading (API routes take priority
+ * over page routes at the same path).
+ */
+async function handleRouteFileCreated(
+  projectRoot: string,
+  config: MeidenConfig,
+  routeStore: RouteStore,
+  filePath: string,
+) {
+  try {
+    const appDir = resolveAppDir(projectRoot, config);
+    const kind: RouteKind = apiRouteFilePattern.test(filePath) ? "api" : "page";
+
+    // Build the manifest entry (includes pattern, segments, params, layouts)
+    const entry = buildRouteManifestEntry(appDir, filePath, kind);
+
+    // Load the module with error isolation — same pattern as loadAppModules.
+    // A broken page/api route should not crash the server; instead it gets
+    // a throwing placeholder that triggers 500 when visited.
+    try {
+      const serverModulePath = createServerModule(projectRoot, filePath);
+      const routeModule = await import(pathToFileURL(serverModulePath).href);
+
+      if (kind === "page") {
+        if (!routeModule.default) {
+          console.warn(`[meiden] New page has no default export: ${filePath}`);
+          entry.Page = () => {
+            throw new Error(`Page missing default export: ${filePath}`);
+          };
+        } else {
+          entry.Page = routeModule.default;
+        }
+      } else {
+        // API route: collect exported HTTP method handlers
+        const handlers: Record<string, (ctx: ApiRouteContext) => any | Promise<any>> = {};
+        for (const method of API_METHODS) {
+          if (typeof routeModule[method] === "function") {
+            handlers[method] = routeModule[method];
+          }
+        }
+        if (Object.keys(handlers).length === 0) {
+          console.warn(`[meiden] New API route has no HTTP method exports: ${filePath}`);
+        }
+        entry.handlers = handlers;
+      }
+    } catch (error) {
+      // Import-time failure (syntax error, missing dep, etc.)
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[meiden] Failed to load new ${kind} module ${filePath}: ${message}`);
+      if (kind === "page") {
+        entry.Page = () => {
+          throw new Error(`Failed to load page: ${message}`);
+        };
+      } else {
+        entry.handlers = {
+          GET: () => { throw new Error(`Failed to load API route: ${message}`); },
+        };
+      }
+    }
+
+    // Add to routesByFilePath (always, even if shadowed by another route)
+    routeStore.routesByFilePath.set(filePath, entry);
+
+    // Add to staticRoutes or dynamicRoutes with the same priority logic
+    // as startServer's initial route loading: API routes take priority
+    // over page routes at the same path.
+    if (entry.isDynamic) {
+      const existingIdx = routeStore.dynamicRoutes.findIndex(r => r.path === entry.path);
+      if (existingIdx !== -1) {
+        const existing = routeStore.dynamicRoutes[existingIdx];
+        if (existing.kind === "page" && entry.kind === "api") {
+          // API route takes priority — replace the page route
+          routeStore.dynamicRoutes[existingIdx] = entry;
+        }
+        // If existing is API and new is page, skip (API takes priority)
+      } else {
+        routeStore.dynamicRoutes.push(entry);
+      }
+    } else {
+      const existing = routeStore.staticRoutes.get(entry.path);
+      if (existing) {
+        if (existing.kind === "page" && entry.kind === "api") {
+          // API route takes priority — replace the page route
+          routeStore.staticRoutes.set(entry.path, entry);
+        }
+        // If existing is API and new is page, skip (API takes priority)
+      } else {
+        routeStore.staticRoutes.set(entry.path, entry);
+      }
+    }
+
+    console.log(`[meiden] Route registered: ${entry.path} (${entry.kind})`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[meiden] Failed to register new route ${filePath}: ${message}`);
+  }
+}
+
+/**
+ * Handle a route file (page.tsx or route.tsx) being deleted.
+ * Removes the entry from the route store. The route will return 404
+ * after deletion.
+ */
+function handleRouteFileDeleted(routeStore: RouteStore, filePath: string) {
+  const entry = routeStore.routesByFilePath.get(filePath);
+  if (!entry) {
+    console.log(`[meiden] Hot reload: deleted file ${filePath} was not a registered route`);
+    return;
+  }
+
+  // Remove from routesByFilePath
+  routeStore.routesByFilePath.delete(filePath);
+
+  // Remove from staticRoutes or dynamicRoutes
+  if (entry.isDynamic) {
+    const idx = routeStore.dynamicRoutes.findIndex(r => r.filePath === filePath);
+    if (idx !== -1) {
+      routeStore.dynamicRoutes.splice(idx, 1);
+    }
+  } else {
+    const existing = routeStore.staticRoutes.get(entry.path);
+    if (existing && existing.filePath === filePath) {
+      routeStore.staticRoutes.delete(entry.path);
+    }
+  }
+
+  console.log(`[meiden] Route removed: ${entry.path} (${entry.kind})`);
+}
+
+/**
+ * Handle a new layout file being created.
+ * If it's the root layout, delegates to hotReloadRootLayout.
+ * If it's a nested layout, loads the module and adds it to
+ * routeStore.nestedLayouts, then updates layout chains for all
+ * page routes that are children of this layout's directory.
+ */
+async function handleLayoutFileCreated(
+  projectRoot: string,
+  config: MeidenConfig,
+  routeStore: RouteStore,
+  filePath: string,
+) {
+  const appDir = resolveAppDir(projectRoot, config);
+
+  // Check if this is the root layout (directly in the app directory)
+  if (dirname(filePath) === appDir) {
+    await hotReloadRootLayout(projectRoot, config, routeStore);
+    console.log(`[meiden] Root layout created: ${filePath}`);
+    return;
+  }
+
+  // Load the nested layout module with error isolation
+  try {
+    const serverModulePath = createServerModule(projectRoot, filePath);
+    const layoutModule = await import(pathToFileURL(serverModulePath).href);
+
+    if (!layoutModule.default) {
+      console.warn(`[meiden] New nested layout has no default export: ${filePath}`);
+      routeStore.nestedLayouts.set(filePath, () => {
+        throw new Error(`Layout missing default export: ${filePath}`);
+      });
+    } else {
+      routeStore.nestedLayouts.set(filePath, layoutModule.default);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[meiden] Failed to load new nested layout ${filePath}: ${message}`);
+    routeStore.nestedLayouts.set(filePath, () => {
+      throw new Error(`Failed to load layout: ${message}`);
+    });
+  }
+
+  // Update layout chains for all page routes that are children of
+  // this layout's directory. resolveLayoutChain checks existsSync,
+  // so it will naturally include the new layout.
+  const layoutDir = dirname(filePath);
+  for (const [pagePath, entry] of routeStore.routesByFilePath) {
+    if (entry.kind === "page" && pagePath.startsWith(layoutDir + "/")) {
+      entry.layouts = resolveLayoutChain(appDir, pagePath);
+    }
+  }
+
+  console.log(`[meiden] Nested layout registered: ${filePath}`);
+}
+
+/**
+ * Handle a layout file being deleted.
+ * Removes it from routeStore.nestedLayouts, then updates layout chains
+ * for all page routes that referenced this layout.
+ * Pages that used this layout will still work but without the layout
+ * wrapper — createLayoutWrapper reads from nestedLayouts at render
+ * time, so removing the entry is sufficient.
+ */
+async function handleLayoutFileDeleted(
+  projectRoot: string,
+  config: MeidenConfig,
+  routeStore: RouteStore,
+  filePath: string,
+) {
+  const appDir = resolveAppDir(projectRoot, config);
+
+  // Check if this is the root layout
+  if (dirname(filePath) === appDir) {
+    console.warn(`[meiden] Root layout deleted: ${filePath} — server may not function correctly`);
+    return;
+  }
+
+  // Remove from nestedLayouts
+  routeStore.nestedLayouts.delete(filePath);
+
+  // Update layout chains for all page routes that referenced this layout.
+  // Since the file has been deleted, resolveLayoutChain will naturally
+  // exclude it (existsSync returns false).
+  for (const [pagePath, entry] of routeStore.routesByFilePath) {
+    if (entry.kind === "page" && entry.layouts.includes(filePath)) {
+      entry.layouts = resolveLayoutChain(appDir, pagePath);
+    }
+  }
+
+  console.log(`[meiden] Layout removed: ${filePath}`);
+}
+
 export async function startServer({ root, port = 3000 }: StartServerOptions) {
   const projectRoot = resolve(root);
 
@@ -2781,18 +3014,25 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
   // import specifier in the page → new page server module hash →
   // Bun's import() loads fresh code.
   //
+  // Route lifecycle: creating a new page/layout/API route file
+  // registers it at runtime without a full server restart. Deleting
+  // a route file removes it from the store so the path returns 404.
+  // Deleting a layout file removes the layout wrapper from affected
+  // pages while keeping them functional.
+  //
   // Debouncing: file editors often trigger multiple change events
   // (write + rename, or multiple writes). We debounce by 100ms to
   // avoid redundant reloads.
   //
-  // Limitations:
-  //   - Adding a new route while the server is running does NOT
-  //     register it (routes are only scanned at startup).
-  //   - Deleting a route file keeps the old route active.
-  //   - Only editing existing routes/components triggers hot reload.
+  // Change type detection: instead of a simple Set, we use a Map
+  // that tracks whether each file was created, updated, or deleted.
+  // This allows the watcher to dispatch to the correct handler:
+  //   - "create": new route/layout file → register it in the store
+  //   - "update": existing file changed → hot reload it
+  //   - "delete": file removed → remove from store (routes 404)
   if (existsSync(appDir)) {
     let reloadTimer: ReturnType<typeof setTimeout> | null = null;
-    const changedFiles = new Set<string>();
+    const changedFiles = new Map<string, "create" | "update" | "delete">();
 
     const watcher = watch(appDir, { recursive: true }, (event, filename) => {
       if (!filename) return;
@@ -2802,28 +3042,95 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
       // Only react to source files
       if (!moduleExtensions.some(ext => filePath.endsWith(ext))) return;
 
-      // All source files in appDir are watched — pages, layouts,
-      // components, utilities. Component changes are resolved via
-      // the dependency graph.
-      changedFiles.add(filePath);
+      // Determine change type based on current file system state and
+      // route store tracking. This is computed at collection time; the
+      // debounce handler may further refine the type at processing time
+      // if rapid changes occurred within the debounce window.
+      if (!existsSync(filePath)) {
+        changedFiles.set(filePath, "delete");
+      } else {
+        const isPageRoute = routeFilePattern.test(filePath) || apiRouteFilePattern.test(filePath);
+        const isLayout = layoutFilePattern.test(filePath);
+        const isRootLayoutFile = isLayout && dirname(filePath) === appDir;
+        const isNewRoute = isPageRoute && !routeStore.routesByFilePath.has(filePath);
+        const isNewLayout = isLayout && !isRootLayoutFile && !routeStore.nestedLayouts.has(filePath);
+
+        if (isNewRoute || isNewLayout) {
+          changedFiles.set(filePath, "create");
+        } else {
+          changedFiles.set(filePath, "update");
+        }
+      }
 
       // Debounce: collect all changed files within 100ms and reload once
       if (reloadTimer) clearTimeout(reloadTimer);
       reloadTimer = setTimeout(async () => {
         reloadTimer = null;
-        const files = [...changedFiles];
+        const files = [...changedFiles.entries()];
         changedFiles.clear();
 
-        for (const file of files) {
-          if (!existsSync(file)) {
-            // File was deleted — skip (route stays with old module)
-            console.log(`[meiden] Hot reload: file deleted ${file}, keeping old module`);
-            continue;
-          }
-
+        for (const [file, changeType] of files) {
           const isLayoutFile = layoutFilePattern.test(file);
           const isPageFile = routeFilePattern.test(file);
           const isApiRouteFile = apiRouteFilePattern.test(file);
+
+          // Refine the change type at processing time to handle edge
+          // cases where rapid changes occurred within the debounce window.
+          let actualType = changeType;
+          if (changeType === "update") {
+            // File was flagged as update but might have been created and
+            // updated within the debounce window ("create" event was
+            // overwritten by "update"). If the route store doesn't know
+            // about this file, treat it as a creation.
+            if (!existsSync(file)) {
+              actualType = "delete";
+            } else if ((isPageFile || isApiRouteFile) && !routeStore.routesByFilePath.has(file)) {
+              actualType = "create";
+            } else if (isLayoutFile && dirname(file) !== appDir && !routeStore.nestedLayouts.has(file)) {
+              actualType = "create";
+            }
+          } else if (changeType === "delete") {
+            // File was flagged as delete but might have been recreated.
+            if (existsSync(file)) {
+              actualType = routeStore.routesByFilePath.has(file) || routeStore.nestedLayouts.has(file)
+                ? "update"
+                : "create";
+            }
+          } else if (changeType === "create") {
+            // File was flagged as create but might have been quickly deleted.
+            if (!existsSync(file)) {
+              continue;
+            }
+          }
+
+          // Dispatch to the appropriate handler based on the refined type
+          if (actualType === "create") {
+            if (isPageFile || isApiRouteFile) {
+              await handleRouteFileCreated(projectRoot, config, routeStore, file);
+            } else if (isLayoutFile) {
+              await handleLayoutFileCreated(projectRoot, config, routeStore, file);
+            }
+            continue;
+          }
+
+          if (actualType === "delete") {
+            if (isPageFile || isApiRouteFile) {
+              handleRouteFileDeleted(routeStore, file);
+            } else if (isLayoutFile) {
+              await handleLayoutFileDeleted(projectRoot, config, routeStore, file);
+            } else {
+              // Component/utility file deleted — keep old module
+              console.log(`[meiden] Hot reload: component deleted ${file}, keeping old module`);
+            }
+            continue;
+          }
+
+          // actualType === "update" — existing hot reload logic
+          if (!existsSync(file)) {
+            // File disappeared between collection and processing
+            console.log(`[meiden] Hot reload: file disappeared ${file}`);
+            continue;
+          }
 
           if (isLayoutFile) {
             // Determine if this is the root layout or a nested layout
