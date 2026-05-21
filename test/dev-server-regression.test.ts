@@ -712,3 +712,74 @@ describe("island/client component hot reload regression", () => {
     }
   });
 });
+
+// ─── Test 12: Island Nested Dependency Hot Reload ──────────────────
+
+describe("island nested dependency hot reload regression", () => {
+  it("should serve updated content when a nested dependency of a use client component is modified (no restart)", async () => {
+    const projectRoot = join(tempRoot, "island-nested-hmr");
+    const appDir = join(projectRoot, "src", "app");
+    const componentsDir = join(appDir, "components");
+
+    mkdirSync(componentsDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Non-client label component — initially renders "Label A"
+    writeFileSync(
+      join(componentsDir, "Label.tsx"),
+      `export default function Label() { return <span>Label A</span>; }`,
+    );
+
+    // Client component (island) imports Label
+    writeFileSync(
+      join(componentsDir, "Counter.tsx"),
+      `"use client";\nimport Label from "./Label";\nexport default function Counter() { return <button onClick={() => {}}><Label /></button>; }`,
+    );
+
+    // Page imports the client component
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `import Counter from "./components/Counter";\n\nexport default function Page() { return <div><Counter /></div>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Step 1: Request / and see the island rendered with "Label A"
+      const resA = await fetchUrl(`${baseUrl}/`);
+      expect(resA.status).toBe(200);
+      expect(resA.body).toContain("Label A");
+      expect(resA.body).toContain("data-meiden-island");
+
+      // Step 2: Edit Label.tsx (nested dependency) to render "Label B"
+      writeFileSync(
+        join(componentsDir, "Label.tsx"),
+        `export default function Label() { return <span>Label B</span>; }`,
+      );
+
+      // Step 3: Wait for the file watcher to detect the change
+      // and propagate it through the dependency graph
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      // Step 4: Request / again — should see "Label B" without restart.
+      // This verifies that the island's nested dependencies are
+      // content-hashed through createServerModule(), so changes to
+      // Label.tsx propagate: Label hash changes → Counter server module
+      // hash changes → proxy hash changes → page hash changes → fresh code.
+      const resB = await fetchUrl(`${baseUrl}/`);
+      expect(resB.status).toBe(200);
+      expect(resB.body).toContain("Label B");
+      expect(resB.body).not.toContain("Label A");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
