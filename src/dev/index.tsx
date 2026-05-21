@@ -144,6 +144,14 @@ interface RouteManifestEntry {
   /** Loaded page component (undefined until loaded, only for kind: "page") */
   Page?: Component;
   /**
+   * Optional data loader function for page routes.
+   * If a page module exports a `load` function, it is called during SSR
+   * with the route params and the result is passed as a `data` prop to
+   * the page component. This enables server-side data fetching.
+   * Only runs on the server — the load function is never sent to the client.
+   */
+  load?: (ctx: { params: Record<string, string> }) => Promise<unknown>;
+  /**
    * Loaded API route handlers (only for kind: "api").
    * Maps HTTP method names ("GET", "POST", "PUT", "DELETE", "PATCH",
    * "HEAD", "OPTIONS") to handler functions.
@@ -163,6 +171,8 @@ interface RouteManifestEntry {
 interface LayoutWrapperProps {
   Page: Component;
   params: Record<string, string>;
+  /** Data returned by the page's optional load() function */
+  data: unknown;
 }
 
 interface IslandReference {
@@ -1611,6 +1621,10 @@ async function loadAppModules(root: string, config: MeidenConfig): Promise<AppMo
           return {
             ...entry,
             Page: routeModule.default,
+            // Extract optional load() export for server-side data fetching.
+            // If the page module exports a `load` function, it will be called
+            // during SSR with route params and the result passed as `data` prop.
+            load: typeof routeModule.load === "function" ? routeModule.load : undefined,
           };
         }
 
@@ -1922,11 +1936,12 @@ export function createLayoutWrapper(
   layoutChain: string[],
   nestedLayouts: Map<string, Component<{ children: unknown }>>,
 ) {
-  return function LayoutWrapper({ Page, params }: LayoutWrapperProps): any {
+  return function LayoutWrapper({ Page, params, data }: LayoutWrapperProps): any {
     // Start with the page component, then wrap with layouts from
     // innermost (nearest to page) to outermost (nearest to root).
     // entry.layouts is ordered nearest-first, so we iterate in order.
-    let element: any = <Page params={params} />;
+    // If the page has a load() function, pass the resolved data as a prop.
+    let element: any = <Page params={params} data={data} />;
 
     for (const layoutPath of layoutChain) {
       const LayoutComponent = nestedLayouts.get(layoutPath);
@@ -1944,8 +1959,8 @@ export function createLayoutWrapper(
   };
 }
 
-async function renderRoute(root: string, LayoutWrapper: Component<LayoutWrapperProps>, route: AppRoute) {
-  return renderReact(root, <LayoutWrapper Page={route.Page} />);
+async function renderRoute(root: string, LayoutWrapper: Component<LayoutWrapperProps>, route: AppRoute, data?: unknown) {
+  return renderReact(root, <LayoutWrapper Page={route.Page} params={{}} data={data} />);
 }
 
 function getIslands(html: string) {
@@ -2046,8 +2061,16 @@ export async function buildApp({
     // API routes don't produce HTML — skip them in the static build
     if (route.kind === "api") continue;
 
+    // Call load() if the page exports one, passing empty params for
+    // static builds (dynamic routes with params are not supported in
+    // static builds — they would need per-param pre-rendering).
+    let data: unknown = undefined;
+    if (route.load) {
+      data = await route.load({ params: {} });
+    }
+
     const LayoutWrapper = createLayoutWrapper(RootLayout, route.layouts, nestedLayouts);
-    const html = await renderRoute(projectRoot, LayoutWrapper, route);
+    const html = await renderRoute(projectRoot, LayoutWrapper, route, data);
     rendered.set(route, html);
 
     for (const island of getIslands(html)) {
@@ -2367,10 +2390,15 @@ async function hotReloadPage(
       existingEntry.Page = () => {
         throw new Error(`Page missing default export: ${filePath}`);
       };
+      existingEntry.load = undefined;
       return;
     }
 
     existingEntry.Page = pageModule.default;
+    // Update the load() function if the module exports one, or clear it
+    // if the module no longer exports load. This ensures hot-reloaded
+    // pages with data loading changes take effect immediately.
+    existingEntry.load = typeof pageModule.load === "function" ? pageModule.load : undefined;
     console.log(`[meiden] Hot reload: ${existingEntry.path}`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -2583,6 +2611,7 @@ async function handleRouteFileCreated(
           };
         } else {
           entry.Page = routeModule.default;
+          entry.load = typeof routeModule.load === "function" ? routeModule.load : undefined;
         }
       } else {
         // API route: collect exported HTTP method handlers
@@ -2940,6 +2969,16 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
 
       // Page route: SSR render with layout chain
       try {
+        // If the page exports a load() function, call it with the route
+        // params to fetch server-side data. The result is passed as a
+        // `data` prop to the page component. If load() throws, the error
+        // is caught and a 500 is returned (same as SSR render errors).
+        // Pages without a load() export receive undefined as data.
+        let data: unknown = undefined;
+        if (entry.load) {
+          data = await entry.load({ params });
+        }
+
         // Create a fresh LayoutWrapper each request using the current
         // RootLayout and nested layout components from the mutable store.
         // This ensures hot-reloaded layouts take effect immediately
@@ -2950,10 +2989,11 @@ export async function startServer({ root, port = 3000 }: StartServerOptions) {
           routeStore.nestedLayouts,
         );
 
-        // Pass params as props to the Page component for dynamic routes.
+        // Pass params and data as props to the Page component.
         // Static routes receive an empty params object.
+        // Pages without load() receive undefined data.
         const Page = entry.Page;
-        const page = <CurrentLayoutWrapper Page={Page} params={params} />;
+        const page = <CurrentLayoutWrapper Page={Page} params={params} data={data} />;
         const html = await renderReact(projectRoot, page);
         logRequest(request.method, routePath, 200, startedAt);
 
