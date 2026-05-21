@@ -2409,3 +2409,352 @@ export default function Page({ data }: { data: { version: string } }) {
     }
   });
 });
+
+// ─── Production Build Tests ──────────────────────────────────────────
+
+/**
+ * Helper: Start the production server as a subprocess.
+ * The generated server.js uses Bun.serve() which starts a real HTTP server.
+ * We run it as a subprocess, wait for it to be ready, then make requests.
+ */
+async function startProdServer(
+  projectRoot: string,
+  port: number,
+): Promise<{ baseUrl: string; cleanup: () => void }> {
+  const serverPath = join(projectRoot, "dist", "server.js");
+  
+  const proc = Bun.spawn(["bun", "run", serverPath], {
+    cwd: projectRoot,
+    env: { ...process.env, PORT: String(port) },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  // Wait for the server to be ready
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+
+  return {
+    baseUrl: `http://localhost:${port}`,
+    cleanup: () => {
+      proc.kill();
+    },
+  };
+}
+
+// Use a base port that's unlikely to conflict with dev server tests
+let prodTestPort = 3600;
+
+describe("production build with dynamic routes", () => {
+  it("should build successfully with dynamic routes (no crash)", async () => {
+    const projectRoot = join(tempRoot, "prod-dynamic-build");
+    const appDir = join(projectRoot, "app");
+
+    mkdirSync(join(appDir, "blog", "[slug]"), { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <html><body>{children}</body></html>; }`,
+    );
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <div>Home</div>; }`,
+    );
+    writeFileSync(
+      join(appDir, "blog", "[slug]", "page.tsx"),
+      `export default function Page({ params }: { params: { slug: string } }) { return <div>Blog: {params.slug}</div>; }`,
+    );
+    writeFileSync(
+      join(projectRoot, "meiden.config.ts"),
+      `export default { appDir: "app" };`,
+    );
+
+    try {
+      const devModulePath = join(import.meta.dir, "..", "src", "dev", "index.tsx");
+      const { buildApp } = await import(devModulePath);
+
+      // This should NOT throw — dynamic routes should not crash the build
+      const result = await buildApp({ root: projectRoot });
+
+      expect(result.routes).toBe(2); // / and /blog/[slug]
+      expect(existsSync(join(result.outDir, "server.js"))).toBe(true);
+      expect(existsSync(join(result.outDir, "_meiden", "server"))).toBe(true);
+
+      // Pre-rendered HTML for static route
+      expect(existsSync(join(result.outDir, "index.html"))).toBe(true);
+
+      // No pre-rendered HTML for dynamic route (it's served by runtime SSR)
+      expect(existsSync(join(result.outDir, "blog", "[slug]", "index.html"))).toBe(false);
+    } finally {
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("should serve dynamic route params correctly in production", async () => {
+    const projectRoot = join(tempRoot, "prod-dynamic-serve");
+    const appDir = join(projectRoot, "app");
+
+    mkdirSync(join(appDir, "blog", "[slug]"), { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <html><body>{children}</body></html>; }`,
+    );
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <div>Home</div>; }`,
+    );
+    writeFileSync(
+      join(appDir, "blog", "[slug]", "page.tsx"),
+      `export default function Page({ params }: { params: { slug: string } }) { return <div>Blog: {params.slug}</div>; }`,
+    );
+    writeFileSync(
+      join(projectRoot, "meiden.config.ts"),
+      `export default { appDir: "app" };`,
+    );
+
+    try {
+      const devModulePath = join(import.meta.dir, "..", "src", "dev", "index.tsx");
+      const { buildApp } = await import(devModulePath);
+      await buildApp({ root: projectRoot });
+
+      const port = prodTestPort++;
+      const { baseUrl, cleanup } = await startProdServer(projectRoot, port);
+
+      try {
+        // Test dynamic route with params
+        const res = await fetchUrl(`${baseUrl}/blog/hello`);
+        expect(res.status).toBe(200);
+        expect(res.body).toContain("hello");
+
+        // Test dynamic route with different params
+        const res2 = await fetchUrl(`${baseUrl}/blog/world`);
+        expect(res2.status).toBe(200);
+        expect(res2.body).toContain("world");
+
+        // Test static route still works
+        const res3 = await fetchUrl(`${baseUrl}/`);
+        expect(res3.status).toBe(200);
+        expect(res3.body).toContain("Home");
+      } finally {
+        cleanup();
+      }
+    } finally {
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("should return 404 for malformed percent-encoded params in production", async () => {
+    const projectRoot = join(tempRoot, "prod-malformed-params");
+    const appDir = join(projectRoot, "app");
+
+    mkdirSync(join(appDir, "blog", "[slug]"), { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <html><body>{children}</body></html>; }`,
+    );
+    writeFileSync(
+      join(appDir, "blog", "[slug]", "page.tsx"),
+      `export default function Page({ params }: { params: { slug: string } }) { return <div>Blog: {params.slug}</div>; }`,
+    );
+    writeFileSync(
+      join(projectRoot, "meiden.config.ts"),
+      `export default { appDir: "app" };`,
+    );
+
+    try {
+      const devModulePath = join(import.meta.dir, "..", "src", "dev", "index.tsx");
+      const { buildApp } = await import(devModulePath);
+      await buildApp({ root: projectRoot });
+
+      const port = prodTestPort++;
+      const { baseUrl, cleanup } = await startProdServer(projectRoot, port);
+
+      try {
+        // Malformed percent-encoding should return 404 (no match), not crash
+        const res = await fetchUrl(`${baseUrl}/blog/%E0%A4%A`);
+        expect(res.status).toBe(404);
+      } finally {
+        cleanup();
+      }
+    } finally {
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("production build with API routes", () => {
+  it("should build and serve API routes in production", async () => {
+    const projectRoot = join(tempRoot, "prod-api-routes");
+    const appDir = join(projectRoot, "app");
+
+    mkdirSync(join(appDir, "api", "hello"), { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <html><body>{children}</body></html>; }`,
+    );
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <div>Home</div>; }`,
+    );
+    writeFileSync(
+      join(appDir, "api", "hello", "route.ts"),
+      `export function GET() {
+  return new Response(JSON.stringify({ hello: "world" }), {
+    headers: { "content-type": "application/json" },
+  });
+}
+
+export function POST() {
+  return new Response(JSON.stringify({ method: "POST" }), {
+    headers: { "content-type": "application/json" },
+  });
+}`,
+    );
+    writeFileSync(
+      join(projectRoot, "meiden.config.ts"),
+      `export default { appDir: "app" };`,
+    );
+
+    try {
+      const devModulePath = join(import.meta.dir, "..", "src", "dev", "index.tsx");
+      const { buildApp } = await import(devModulePath);
+      await buildApp({ root: projectRoot });
+
+      const port = prodTestPort++;
+      const { baseUrl, cleanup } = await startProdServer(projectRoot, port);
+
+      try {
+        // GET /api/hello
+        const res = await fetchUrl(`${baseUrl}/api/hello`);
+        expect(res.status).toBe(200);
+        const data = JSON.parse(res.body);
+        expect(data.hello).toBe("world");
+
+        // POST /api/hello
+        const res2 = await fetchUrl(`${baseUrl}/api/hello`, { method: "POST" });
+        expect(res2.status).toBe(200);
+        const data2 = JSON.parse(res2.body);
+        expect(data2.method).toBe("POST");
+
+        // DELETE /api/hello — unsupported method → 405
+        const res3 = await fetchUrl(`${baseUrl}/api/hello`, { method: "DELETE" });
+        expect(res3.status).toBe(405);
+      } finally {
+        cleanup();
+      }
+    } finally {
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("should serve dynamic API route params in production", async () => {
+    const projectRoot = join(tempRoot, "prod-api-dynamic");
+    const appDir = join(projectRoot, "app");
+
+    mkdirSync(join(appDir, "api", "user", "[id]"), { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <html><body>{children}</body></html>; }`,
+    );
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <div>Home</div>; }`,
+    );
+    writeFileSync(
+      join(appDir, "api", "user", "[id]", "route.ts"),
+      `export function GET({ params }: { params: { id: string } }) {
+  return new Response(JSON.stringify({ id: params.id }), {
+    headers: { "content-type": "application/json" },
+  });
+}`,
+    );
+    writeFileSync(
+      join(projectRoot, "meiden.config.ts"),
+      `export default { appDir: "app" };`,
+    );
+
+    try {
+      const devModulePath = join(import.meta.dir, "..", "src", "dev", "index.tsx");
+      const { buildApp } = await import(devModulePath);
+      await buildApp({ root: projectRoot });
+
+      const port = prodTestPort++;
+      const { baseUrl, cleanup } = await startProdServer(projectRoot, port);
+
+      try {
+        const res = await fetchUrl(`${baseUrl}/api/user/42`);
+        expect(res.status).toBe(200);
+        const data = JSON.parse(res.body);
+        expect(data.id).toBe("42");
+      } finally {
+        cleanup();
+      }
+    } finally {
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("should return controlled 500 for broken API route in production", async () => {
+    const projectRoot = join(tempRoot, "prod-api-broken");
+    const appDir = join(projectRoot, "app");
+
+    mkdirSync(join(appDir, "api", "broken"), { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <html><body>{children}</body></html>; }`,
+    );
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <div>Home</div>; }`,
+    );
+    writeFileSync(
+      join(appDir, "api", "broken", "route.ts"),
+      `export function GET() {
+  throw new Error("Something went wrong");
+}`,
+    );
+    writeFileSync(
+      join(projectRoot, "meiden.config.ts"),
+      `export default { appDir: "app" };`,
+    );
+
+    try {
+      const devModulePath = join(import.meta.dir, "..", "src", "dev", "index.tsx");
+      const { buildApp } = await import(devModulePath);
+      await buildApp({ root: projectRoot });
+
+      const port = prodTestPort++;
+      const { baseUrl, cleanup } = await startProdServer(projectRoot, port);
+
+      try {
+        // Broken API route should return controlled 500, not crash the server
+        const res = await fetchUrl(`${baseUrl}/api/broken`);
+        expect(res.status).toBe(500);
+
+        // Server should still be alive for other routes
+        const res2 = await fetchUrl(`${baseUrl}/`);
+        expect(res2.status).toBe(200);
+      } finally {
+        cleanup();
+      }
+    } finally {
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
