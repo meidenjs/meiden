@@ -1941,12 +1941,14 @@ export function createLayoutWrapper(
     // innermost (nearest to page) to outermost (nearest to root).
     // entry.layouts is ordered nearest-first, so we iterate in order.
     // If the page has a load() function, pass the resolved data as a prop.
+    // Nested layouts receive `params` so they can access dynamic route
+    // params (e.g., for rendering breadcrumbs in blog/[slug]/layout.tsx).
     let element: any = <Page params={params} data={data} />;
 
     for (const layoutPath of layoutChain) {
       const LayoutComponent = nestedLayouts.get(layoutPath);
       if (LayoutComponent) {
-        element = <LayoutComponent>{element}</LayoutComponent>;
+        element = <LayoutComponent params={params}>{element}</LayoutComponent>;
       } else {
         // Layout file was listed but not loaded — this shouldn't
         // normally happen, but if it does, use a throwing placeholder
@@ -1954,8 +1956,8 @@ export function createLayoutWrapper(
       }
     }
 
-    // Root layout is always the outermost wrapper
-    return <RootLayout>{element}</RootLayout>;
+    // Root layout is always the outermost wrapper; it also receives params
+    return <RootLayout params={params}>{element}</RootLayout>;
   };
 }
 
@@ -2553,29 +2555,32 @@ async function renderPage(entry, params) {
   }
 
   // Load nested layouts (nearest first → wrap from innermost to outermost)
+  // Pass params to nested layouts so they can access dynamic route params
+  // (e.g., for rendering breadcrumbs in blog/[slug]/layout.tsx).
   let element = React.createElement(Page, { params, data });
   for (const layoutPath of entry.layoutModulePaths) {
     const layoutMod = await loadModule(layoutPath);
     if (layoutMod.default) {
-      element = React.createElement(layoutMod.default, null, element);
+      element = React.createElement(layoutMod.default, { params }, element);
     }
   }
-  // Root layout is always outermost
-  element = React.createElement(RootLayout, null, element);
+  // Root layout is always outermost; it also receives params
+  element = React.createElement(RootLayout, { params }, element);
 
   // SSR render
   const html = "<!DOCTYPE html>" + renderToString(element);
 
-  // Inject island runtime and shared chunks if HTML contains islands
-  const hasIslands = html.includes("data-meiden-island");
+  // Inject island runtime and shared chunks if HTML contains islands.
+  // Uses the same injection strategy as the dev server: inject the
+  // shared chunk scripts + runtime script before </body>, or append
+  // at the end if no </body> tag is found.
   let finalHtml = html;
-  if (hasIslands) {
-    const runtimeScript = '<script type="module" src="/_meiden/islands/runtime.js">';
-    const chunksPlusRuntime = "${sharedChunkScripts}\\n" + runtimeScript;
-    if (finalHtml.includes(runtimeScript)) {
-      finalHtml = finalHtml.replace(runtimeScript, chunksPlusRuntime);
-    } else if (finalHtml.includes("</body>")) {
-      finalHtml = finalHtml.replace("</body>", chunksPlusRuntime + "</script></body>");
+  if (finalHtml.includes("data-meiden-island")) {
+    const chunksPlusRuntime = "${sharedChunkScripts}\\n" + '<script type="module" src="/_meiden/islands/runtime.js"></script>';
+    if (finalHtml.includes("</body>")) {
+      finalHtml = finalHtml.replace("</body>", chunksPlusRuntime + "</body>");
+    } else {
+      finalHtml = finalHtml + chunksPlusRuntime;
     }
   }
 
@@ -2591,7 +2596,13 @@ async function handleApiRoute(entry, params, request) {
     return new Response("Method Not Allowed", { status: 405, headers: { Allow: Object.keys(apiMod).filter(k => typeof apiMod[k] === "function").join(", ") } });
   }
 
-  return handler({ request, params });
+  // If the handler returns a Response, use it directly.
+  // Otherwise, JSON-encode the result (same behavior as dev server).
+  const result = await handler({ request, params });
+  if (result instanceof Response) {
+    return result;
+  }
+  return Response.json(result);
 }
 
 const port = Number(process.env.PORT) || 3000;
@@ -2703,8 +2714,8 @@ async function buildStaticServer(outDir: string, routes: AppRoute[]) {
     .join(",\n");
 
   const entryContent = `
-const { existsSync, statSync } = require("node:fs");
-const { join, resolve, extname } = require("node:path");
+import { existsSync, statSync } from "node:fs";
+import { join, resolve, extname } from "node:path";
 
 const distRoot = import.meta.dir;
 const contentTypes = {
@@ -2715,7 +2726,7 @@ function safeDecodeURIComponent(encoded) {
   try {
     return decodeURIComponent(encoded);
   } catch {
-    return encoded;
+    return null;
   }
 }
 
@@ -2726,6 +2737,7 @@ function resolveBuiltFile(requestPath) {
   } catch {
     return undefined;
   }
+  if (pathname === null) return undefined;
   const cleanPath = pathname.replace(/^\\/+/, "");
   const candidates = [
     cleanPath ? join(distRoot, cleanPath) : join(distRoot, "index.html"),
