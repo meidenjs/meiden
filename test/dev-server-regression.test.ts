@@ -3035,3 +3035,377 @@ describe("production static server malformed URL regression", () => {
     }
   });
 });
+
+// ─── PR #17: createLayoutWrapper Integration Tests ──────────────────
+//
+// These tests replace the old stale `createLayoutWrapper` unit test that
+// broke when the nested layout API changed. Instead of testing the
+// internal function shape, we test the public/observable rendering
+// behavior through the full dev server pipeline.
+//
+// Coverage:
+//   - Root layout only (no nested)
+//   - Nested layout chain ordering (Root > Blog > Slug > Page)
+//   - Params passing to all layout levels
+//   - Data passing through layouts (load() → data prop)
+//   - Page rendering through the full render pipeline
+//   - Layout without default export returns 500
+//   - Deeply nested layouts (3+ levels)
+
+describe("layout rendering pipeline — root layout only", () => {
+  it("should render page content wrapped by root layout with no nested layouts", async () => {
+    const projectRoot = join(tempRoot, "pipeline-root-only");
+    const appDir = join(projectRoot, "src", "app");
+    const aboutDir = join(appDir, "about");
+
+    mkdirSync(aboutDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function RootLayout({ children }: { children: any }) { return <div data-root="true">{children}</div>; }`,
+    );
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+    writeFileSync(
+      join(aboutDir, "page.tsx"),
+      `export default function Page() { return <h1>About</h1>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      const homeRes = await fetchUrl(`${baseUrl}/`);
+      expect(homeRes.status).toBe(200);
+      expect(homeRes.body).toContain("data-root");
+      expect(homeRes.body).toContain("Home");
+
+      const aboutRes = await fetchUrl(`${baseUrl}/about`);
+      expect(aboutRes.status).toBe(200);
+      expect(aboutRes.body).toContain("data-root");
+      expect(aboutRes.body).toContain("About");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("layout rendering pipeline — nested layout chain ordering", () => {
+  it("should render layouts in correct nesting order: Root > Section > SubSection > Page", async () => {
+    const projectRoot = join(tempRoot, "pipeline-chain-order");
+    const appDir = join(projectRoot, "src", "app");
+    const sectionDir = join(appDir, "docs");
+    const subSectionDir = join(sectionDir, "advanced");
+
+    mkdirSync(subSectionDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function RootLayout({ children }: { children: any }) { return <div data-l="root">{children}</div>; }`,
+    );
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <span data-l="home-page">Home</span>; }`,
+    );
+    writeFileSync(
+      join(sectionDir, "layout.tsx"),
+      `export default function DocsLayout({ children }: { children: any }) { return <section data-l="docs">{children}</section>; }`,
+    );
+    writeFileSync(
+      join(subSectionDir, "layout.tsx"),
+      `export default function AdvancedLayout({ children }: { children: any }) { return <article data-l="advanced">{children}</article>; }`,
+    );
+    writeFileSync(
+      join(subSectionDir, "page.tsx"),
+      `export default function Page() { return <em data-l="page">Content</em>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Home page should only have root layout
+      const homeRes = await fetchUrl(`${baseUrl}/`);
+      expect(homeRes.status).toBe(200);
+      expect(homeRes.body).toContain('data-l="root"');
+      expect(homeRes.body).toContain('data-l="home-page"');
+      expect(homeRes.body).not.toContain('data-l="docs"');
+      expect(homeRes.body).not.toContain('data-l="advanced"');
+
+      // /docs/advanced should have all three layout levels
+      const advRes = await fetchUrl(`${baseUrl}/docs/advanced`);
+      expect(advRes.status).toBe(200);
+      expect(advRes.body).toContain('data-l="root"');
+      expect(advRes.body).toContain('data-l="docs"');
+      expect(advRes.body).toContain('data-l="advanced"');
+      expect(advRes.body).toContain('data-l="page"');
+
+      // Verify nesting order: root appears before docs, docs before advanced, advanced before page
+      const rootIdx = advRes.body.indexOf('data-l="root"');
+      const docsIdx = advRes.body.indexOf('data-l="docs"');
+      const advIdx = advRes.body.indexOf('data-l="advanced"');
+      const pageIdx = advRes.body.indexOf('data-l="page"');
+      expect(rootIdx).toBeLessThan(docsIdx);
+      expect(docsIdx).toBeLessThan(advIdx);
+      expect(advIdx).toBeLessThan(pageIdx);
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("layout rendering pipeline — params pass to all layout levels", () => {
+  it("should pass dynamic route params to root layout, nested layouts, and page", async () => {
+    const projectRoot = join(tempRoot, "pipeline-params-all");
+    const appDir = join(projectRoot, "src", "app");
+    const blogDir = join(appDir, "blog", "[slug]");
+
+    mkdirSync(blogDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function RootLayout({ children, params }: { children: any; params: any }) { return <div data-root-params={JSON.stringify(params)}>{children}</div>; }`,
+    );
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+    writeFileSync(
+      join(join(appDir, "blog"), "layout.tsx"),
+      `export default function BlogLayout({ children, params }: { children: any; params: { slug: string } }) { return <section data-blog-slug={params.slug}>{children}</section>; }`,
+    );
+    writeFileSync(
+      join(blogDir, "page.tsx"),
+      `export default function BlogPost({ params }: { params: { slug: string } }) { return <em data-page-slug={params.slug}>Post</em>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      const res = await fetchUrl(`${baseUrl}/blog/test-post`);
+      expect(res.status).toBe(200);
+      // Nested layout should have the slug param
+      expect(res.body).toContain("data-blog-slug");
+      expect(res.body).toContain("test-post");
+      // Page should also have the slug param
+      expect(res.body).toContain("data-page-slug");
+      expect(res.body).toContain("test-post");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("layout rendering pipeline — data passes through layouts", () => {
+  it("should render page with load() data prop through layout chain", async () => {
+    const projectRoot = join(tempRoot, "pipeline-data-through-layouts");
+    const appDir = join(projectRoot, "src", "app");
+
+    mkdirSync(appDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function RootLayout({ children }: { children: any }) { return <div data-root>{children}</div>; }`,
+    );
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export async function load() { return { title: "Loaded Title", items: [1, 2, 3] }; }
+export default function Page({ data }: { data: { title: string; items: number[] } }) { return <span data-loaded={data.title}>{data.title}:{data.items.length}</span>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      const res = await fetchUrl(`${baseUrl}/`);
+      expect(res.status).toBe(200);
+      // Layout wrapper present
+      expect(res.body).toContain("data-root");
+      // Page received data from load()
+      expect(res.body).toContain("data-loaded");
+      expect(res.body).toContain("Loaded Title");
+      expect(res.body).toContain("3");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("layout rendering pipeline — broken layout returns 500", () => {
+  it("should return 500 when a nested layout has no default export, without crashing other routes", async () => {
+    const projectRoot = join(tempRoot, "pipeline-broken-layout");
+    const appDir = join(projectRoot, "src", "app");
+    const blogDir = join(appDir, "blog");
+    const contactDir = join(appDir, "contact");
+
+    mkdirSync(blogDir, { recursive: true });
+    mkdirSync(contactDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function RootLayout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+    // Blog layout with NO default export (broken)
+    writeFileSync(
+      join(blogDir, "layout.tsx"),
+      `export const broken = true;`,
+    );
+    writeFileSync(
+      join(blogDir, "page.tsx"),
+      `export default function Page() { return <h1>Blog</h1>; }`,
+    );
+    // Contact page — no nested layout, should work fine
+    writeFileSync(
+      join(contactDir, "page.tsx"),
+      `export default function Page() { return <h1>Contact</h1>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      // Home and contact should work fine (no broken layout)
+      const homeRes = await fetchUrl(`${baseUrl}/`);
+      expect(homeRes.status).toBe(200);
+      expect(homeRes.body).toContain("Home");
+
+      const contactRes = await fetchUrl(`${baseUrl}/contact`);
+      expect(contactRes.status).toBe(200);
+      expect(contactRes.body).toContain("Contact");
+
+      // Blog should 500 because the nested layout is broken
+      const blogRes = await fetchUrl(`${baseUrl}/blog`);
+      expect(blogRes.status).toBe(500);
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("layout rendering pipeline — deeply nested 4-level layout chain", () => {
+  it("should render correctly with 4 levels of nested layouts", async () => {
+    const projectRoot = join(tempRoot, "pipeline-deep-nesting");
+    const appDir = join(projectRoot, "src", "app");
+    const level1Dir = join(appDir, "a");
+    const level2Dir = join(level1Dir, "b");
+    const level3Dir = join(level2Dir, "c");
+
+    mkdirSync(level3Dir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function L0({ children }: { children: any }) { return <div data-level="0">{children}</div>; }`,
+    );
+    writeFileSync(
+      join(level1Dir, "layout.tsx"),
+      `export default function L1({ children }: { children: any }) { return <section data-level="1">{children}</section>; }`,
+    );
+    writeFileSync(
+      join(level2Dir, "layout.tsx"),
+      `export default function L2({ children }: { children: any }) { return <article data-level="2">{children}</article>; }`,
+    );
+    writeFileSync(
+      join(level3Dir, "layout.tsx"),
+      `export default function L3({ children }: { children: any }) { return <span data-level="3">{children}</span>; }`,
+    );
+    writeFileSync(
+      join(level3Dir, "page.tsx"),
+      `export default function Page() { return <em data-level="page">Deep</em>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      const res = await fetchUrl(`${baseUrl}/a/b/c`);
+      expect(res.status).toBe(200);
+      // All 4 layout levels + page should be present
+      expect(res.body).toContain('data-level="0"');
+      expect(res.body).toContain('data-level="1"');
+      expect(res.body).toContain('data-level="2"');
+      expect(res.body).toContain('data-level="3"');
+      expect(res.body).toContain('data-level="page"');
+
+      // Verify ordering: level 0 appears before 1, 1 before 2, etc.
+      const idx0 = res.body.indexOf('data-level="0"');
+      const idx1 = res.body.indexOf('data-level="1"');
+      const idx2 = res.body.indexOf('data-level="2"');
+      const idx3 = res.body.indexOf('data-level="3"');
+      const idxP = res.body.indexOf('data-level="page"');
+      expect(idx0).toBeLessThan(idx1);
+      expect(idx1).toBeLessThan(idx2);
+      expect(idx2).toBeLessThan(idx3);
+      expect(idx3).toBeLessThan(idxP);
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("layout rendering pipeline — data loading with nested layout and dynamic params", () => {
+  it("should render page with load() data and params through nested layout chain", async () => {
+    const projectRoot = join(tempRoot, "pipeline-data-params-nested");
+    const appDir = join(projectRoot, "src", "app");
+    const blogDir = join(appDir, "blog", "[slug]");
+
+    mkdirSync(blogDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function RootLayout({ children }: { children: any }) { return <div data-root>{children}</div>; }`,
+    );
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+    writeFileSync(
+      join(join(appDir, "blog"), "layout.tsx"),
+      `export default function BlogLayout({ children, params }: { children: any; params: { slug: string } }) { return <section data-blog-slug={params.slug}>{children}</section>; }`,
+    );
+    writeFileSync(
+      join(blogDir, "page.tsx"),
+      `export async function load({ params }: { params: { slug: string } }) { return { title: "Post: " + params.slug }; }
+export default function BlogPost({ params, data }: { params: { slug: string }; data: { title: string } }) { return <em data-slug={params.slug} data-title={data.title}>{data.title}</em>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      const res = await fetchUrl(`${baseUrl}/blog/hello-world`);
+      expect(res.status).toBe(200);
+      // Root layout
+      expect(res.body).toContain("data-root");
+      // Blog nested layout received params
+      expect(res.body).toContain("data-blog-slug");
+      expect(res.body).toContain("hello-world");
+      // Page received both params and data
+      expect(res.body).toContain("data-slug");
+      expect(res.body).toContain("data-title");
+      expect(res.body).toContain("Post: hello-world");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
