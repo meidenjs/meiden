@@ -2064,8 +2064,22 @@ export async function buildApp({
   mkdirSync(outputRoot, { recursive: true });
   copyPublicDir(join(projectRoot, "public"), outputRoot);
 
-  // Pre-render only static page routes to HTML
+  // Build a set of paths that have API routes, so we can skip
+  // pre-rendering pages that share the same path. API routes must
+  // take priority over page routes at the same URL — if we pre-render
+  // the page to a static HTML file, the production server would serve
+  // that file before ever reaching the API route handler.
+  const apiRoutePaths = new Set(apiRoutes.map(r => r.path));
+
+  // Pre-render only static page routes to HTML, unless the path
+  // is shadowed by an API route (API routes take priority).
   for (const route of staticPageRoutes) {
+    // Skip pre-rendering if an API route exists at the same path.
+    // The runtime server will handle this path via the API route.
+    if (apiRoutePaths.has(route.path)) {
+      continue;
+    }
+
     // Call load() if the page exports one, passing empty params for
     // static builds (static routes have no dynamic params).
     let data: unknown = undefined;
@@ -2416,13 +2430,16 @@ const routeManifest = ${manifestSource};
 
 // Build lookup structures: static routes by exact path, dynamic routes
 // for sequential regex matching (same strategy as dev server)
+// API routes are separated into their own list so they can be checked
+// before static file serving (API routes take priority).
 const staticRoutes = new Map();
 const dynamicRoutes = [];
+const apiRoutes = [];
 
 for (const entry of routeManifest) {
   // API routes always need runtime matching (they're never pre-rendered)
   if (entry.kind === "api") {
-    dynamicRoutes.push({ ...entry, pattern: new RegExp(entry.pattern) });
+    apiRoutes.push({ ...entry, pattern: new RegExp(entry.pattern) });
     continue;
   }
   // Dynamic page routes need runtime matching
@@ -2587,7 +2604,42 @@ Bun.serve({
     try { pathname = new URL(request.url).pathname; } catch { pathname = request.url; }
     const method = request.method;
 
-    // 1. Try static file serving first (public/, pre-rendered HTML, island bundles)
+    // 1. Check if the path matches an API route first.
+    // API routes take priority over static file serving and page routes,
+    // matching the dev server's behavior where API routes are checked
+    // before page routes at the same path. Without this check, a
+    // pre-rendered HTML file for a page at the same path would be
+    // served before the API route handler ever gets a chance.
+    for (const entry of apiRoutes) {
+      const match = pathname.match(entry.pattern);
+      if (match) {
+        const params = {};
+        for (let i = 0; i < entry.params.length; i++) {
+          const paramName = entry.params[i];
+          const captured = match[i + 1];
+          const decoded = captured ? safeDecodeParam(captured) : "";
+          if (decoded === null) break;
+          params[paramName] = decoded;
+        }
+        try {
+          const response = await handleApiRoute(entry, params, request);
+          const status = response instanceof Response ? response.status : 200;
+          const duration = (performance.now() - startedAt).toFixed(1);
+          const statusStr = String(status).padStart(3);
+          const colorCode = status >= 400 ? "\\x1b[31m" : "\\x1b[32m";
+          console.log(colorCode + statusStr + "\\x1b[0m  " + method.padEnd(4) + "  " + pathname.padEnd(8) + "  " + duration + "ms");
+          return response;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error("[meiden] Production error for " + pathname + ": " + message);
+          const duration = (performance.now() - startedAt).toFixed(1);
+          console.log("\\x1b[31m500\\x1b[0m  " + method.padEnd(4) + "  " + pathname.padEnd(8) + "  " + duration + "ms");
+          return new Response("Internal Server Error", { status: 500 });
+        }
+      }
+    }
+
+    // 2. Try static file serving (public/, pre-rendered HTML, island bundles)
     const filePath = resolveBuiltFile(request.url);
     if (filePath) {
       const duration = (performance.now() - startedAt).toFixed(1);
@@ -2598,7 +2650,7 @@ Bun.serve({
       });
     }
 
-    // 2. Try route manifest matching (dynamic pages, API routes)
+    // 3. Try route manifest matching (dynamic pages, static pages as fallback)
     const match = matchRoute(pathname);
     if (!match) {
       const duration = (performance.now() - startedAt).toFixed(1);
@@ -2609,16 +2661,6 @@ Bun.serve({
     const { entry, params } = match;
 
     try {
-      if (entry.kind === "api") {
-        const response = await handleApiRoute(entry, params, request);
-        const status = response instanceof Response ? response.status : 200;
-        const duration = (performance.now() - startedAt).toFixed(1);
-        const statusStr = String(status).padStart(3);
-        const colorCode = status >= 400 ? "\\x1b[31m" : "\\x1b[32m";
-        console.log(colorCode + statusStr + "\\x1b[0m  " + method.padEnd(4) + "  " + pathname.padEnd(8) + "  " + duration + "ms");
-        return response;
-      }
-
       // Page route: SSR
       const html = await renderPage(entry, params);
       const duration = (performance.now() - startedAt).toFixed(1);
