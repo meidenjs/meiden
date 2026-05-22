@@ -2821,3 +2821,217 @@ export function POST() {
     }
   });
 });
+
+// ─── Test PR#16: Nested Layout Receives Params (Dev) ────────────────
+
+describe("nested layout receives params regression", () => {
+  it("should pass params to nested layout in dev server", async () => {
+    const projectRoot = join(tempRoot, "layout-params-dev");
+    const appDir = join(projectRoot, "src", "app");
+    const blogDir = join(appDir, "blog", "[slug]");
+
+    mkdirSync(blogDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    // Root layout
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function RootLayout({ children }: { children: any }) { return <div>{children}</div>; }`,
+    );
+
+    // Home page
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <h1>Home</h1>; }`,
+    );
+
+    // Blog nested layout that uses params
+    writeFileSync(
+      join(blogDir, "layout.tsx"),
+      `export default function BlogLayout({ children, params }: { children: any; params: { slug: string } }) { return <section>LAYOUT:{params.slug}:{children}</section>; }`,
+    );
+
+    // Blog post page
+    writeFileSync(
+      join(blogDir, "page.tsx"),
+      `export default function BlogPost({ params }: { params: { slug: string } }) { return <em>{params.slug}</em>; }`,
+    );
+
+    const { baseUrl, app } = await startDevServer(projectRoot);
+
+    try {
+      const res = await fetchUrl(`${baseUrl}/blog/my-post`);
+      expect(res.status).toBe(200);
+      // Nested layout should have received params
+      expect(res.body).toContain("LAYOUT:");
+      expect(res.body).toContain("my-post");
+    } finally {
+      app.stop?.();
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test PR#16: Production Server — API Auto-JSON Wrapping ──────────
+
+describe("production API route auto-JSON wrapping", () => {
+  it("should auto-JSON-encode non-Response return values from API handlers", async () => {
+    const projectRoot = join(tempRoot, "prod-api-json-wrap");
+    const appDir = join(projectRoot, "app");
+
+    mkdirSync(join(appDir, "api", "data"), { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <html><body>{children}</body></html>; }`,
+    );
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <div>Home</div>; }`,
+    );
+    // API route returning plain object (not Response) — should be auto-JSON-wrapped
+    writeFileSync(
+      join(appDir, "api", "data", "route.ts"),
+      `export function GET() { return { message: "hello", count: 42 }; }`,
+    );
+    writeFileSync(
+      join(projectRoot, "meiden.config.ts"),
+      `export default { appDir: "app" };`,
+    );
+
+    try {
+      const devModulePath = join(import.meta.dir, "..", "src", "dev", "index.tsx");
+      const { buildApp } = await import(devModulePath);
+      await buildApp({ root: projectRoot });
+
+      const port = prodTestPort++;
+      const { baseUrl, cleanup } = await startProdServer(projectRoot, port);
+
+      try {
+        const res = await fetchUrl(`${baseUrl}/api/data`);
+        expect(res.status).toBe(200);
+        expect(res.headers.get("content-type")).toContain("application/json");
+        const data = JSON.parse(res.body);
+        expect(data.message).toBe("hello");
+        expect(data.count).toBe(42);
+      } finally {
+        cleanup();
+      }
+    } finally {
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test PR#16: Production Server — Nested Layout Receives Params ──
+
+describe("production nested layout receives params", () => {
+  it("should pass params to nested layout in production server", async () => {
+    const projectRoot = join(tempRoot, "prod-layout-params");
+    const appDir = join(projectRoot, "app");
+
+    mkdirSync(join(appDir, "blog", "[slug]"), { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function RootLayout({ children }: { children: any }) { return <html><body>{children}</body></html>; }`,
+    );
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <div>Home</div>; }`,
+    );
+    // Blog nested layout that uses params
+    writeFileSync(
+      join(appDir, "blog", "layout.tsx"),
+      `export default function BlogLayout({ children, params }: { children: any; params: { slug: string } }) { return <section>LAYOUT:{params.slug}:{children}</section>; }`,
+    );
+    // Blog post page
+    writeFileSync(
+      join(appDir, "blog", "[slug]", "page.tsx"),
+      `export default function Page({ params }: { params: { slug: string } }) { return <em>Post:{params.slug}</em>; }`,
+    );
+    writeFileSync(
+      join(projectRoot, "meiden.config.ts"),
+      `export default { appDir: "app" };`,
+    );
+
+    try {
+      const devModulePath = join(import.meta.dir, "..", "src", "dev", "index.tsx");
+      const { buildApp } = await import(devModulePath);
+      await buildApp({ root: projectRoot });
+
+      const port = prodTestPort++;
+      const { baseUrl, cleanup } = await startProdServer(projectRoot, port);
+
+      try {
+        const res = await fetchUrl(`${baseUrl}/blog/test-post`);
+        expect(res.status).toBe(200);
+        // Nested layout should have received params
+        expect(res.body).toContain("LAYOUT:");
+        expect(res.body).toContain("test-post");
+        // Page should also work
+        expect(res.body).toContain("Post:");
+      } finally {
+        cleanup();
+      }
+    } finally {
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── Test PR#16: Static Server — Malformed URL Returns 404 ──────────
+
+describe("production static server malformed URL regression", () => {
+  it("should return 404 for malformed percent-encoded URLs in static site (no crash)", async () => {
+    const projectRoot = join(tempRoot, "prod-static-malformed");
+    const appDir = join(projectRoot, "app");
+
+    mkdirSync(appDir, { recursive: true });
+    symlinkNodeModules(projectRoot);
+    writePackageJson(projectRoot);
+
+    writeFileSync(
+      join(appDir, "layout.tsx"),
+      `export default function Layout({ children }: { children: any }) { return <html><body>{children}</body></html>; }`,
+    );
+    writeFileSync(
+      join(appDir, "page.tsx"),
+      `export default function Page() { return <div>Home</div>; }`,
+    );
+    writeFileSync(
+      join(projectRoot, "meiden.config.ts"),
+      `export default { appDir: "app" };`,
+    );
+
+    try {
+      const devModulePath = join(import.meta.dir, "..", "src", "dev", "index.tsx");
+      const { buildApp } = await import(devModulePath);
+      await buildApp({ root: projectRoot });
+
+      // This is a static-only site, so it uses buildStaticServer
+      const port = prodTestPort++;
+      const { baseUrl, cleanup } = await startProdServer(projectRoot, port);
+
+      try {
+        // Valid request should work
+        const validRes = await fetchUrl(`${baseUrl}/`);
+        expect(validRes.status).toBe(200);
+        expect(validRes.body).toContain("Home");
+
+        // Malformed URL should return 404, not crash
+        const malformedRes = await fetchUrl(`${baseUrl}/%E0%A4%A`);
+        expect(malformedRes.status).toBe(404);
+      } finally {
+        cleanup();
+      }
+    } finally {
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
