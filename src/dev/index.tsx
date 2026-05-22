@@ -219,6 +219,9 @@ const reactHooks = new Set([
   "useImperativeHandle",
   "useOptimistic",
   "useActionState",
+  "useId",
+  "use",
+  "useFormStatus",
 ]);
 
 const browserGlobals = new Set(["window", "document", "localStorage", "sessionStorage", "navigator"]);
@@ -816,7 +819,7 @@ try {
 
 /**
  * React Error Boundary for island rendering errors (best-effort).
- * React 18's server-side renderToString supports Error Boundaries, so
+ * React's server-side renderToString supports Error Boundaries, so
  * this can catch component-thrown errors during render in many cases.
  * However, this is not a guarantee — some errors (e.g. in lifecycle
  * methods, or errors that occur outside React's error handling) may

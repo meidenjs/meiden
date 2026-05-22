@@ -57,8 +57,8 @@ function writePackageJson(projectRoot: string) {
       name: "test-app",
       type: "module",
       dependencies: {
-        react: "^18.3.1",
-        "react-dom": "^18.3.1",
+        react: "^19.1.0",
+        "react-dom": "^19.1.0",
       },
     }),
   );
